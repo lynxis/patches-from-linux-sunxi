@@ -1,0 +1,12 @@
+diff --git a/include/linux/alarmtimer.h b/include/linux/alarmtimer.h
+index 975009e..96c5c24 100644
+--- a/include/linux/alarmtimer.h
++++ b/include/linux/alarmtimer.h
+@@ -76,4 +76,7 @@ static inline int alarmtimer_callback_running(struct alarm *timer)
+ }
+ 
+ 
++/* Provide way to access the rtc device being used by alarmtimers */
++struct rtc_device *alarmtimer_get_rtcdev(void);
++
+ #endif

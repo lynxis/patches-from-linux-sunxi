@@ -1,0 +1,136 @@
+diff --git a/include/linux/if_pppolac.h b/include/linux/if_pppolac.h
+new file mode 100644
+index 0000000..c06bd6c
+--- /dev/null
++++ b/include/linux/if_pppolac.h
+@@ -0,0 +1,33 @@
++/* include/linux/if_pppolac.h
++ *
++ * Header for PPP on L2TP Access Concentrator / PPPoLAC Socket (RFC 2661)
++ *
++ * Copyright (C) 2009 Google, Inc.
++ * Author: Chia-chi Yeh <chiachi@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __LINUX_IF_PPPOLAC_H
++#define __LINUX_IF_PPPOLAC_H
++
++#include <linux/socket.h>
++#include <linux/types.h>
++
++struct sockaddr_pppolac {
++	sa_family_t	sa_family;	/* AF_PPPOX */
++	unsigned int	sa_protocol;	/* PX_PROTO_OLAC */
++	int		udp_socket;
++	struct __attribute__((packed)) {
++		__u16	tunnel, session;
++	} local, remote;
++} __attribute__((packed));
++
++#endif /* __LINUX_IF_PPPOLAC_H */
+diff --git a/include/linux/if_pppopns.h b/include/linux/if_pppopns.h
+new file mode 100644
+index 0000000..0cf34b4
+--- /dev/null
++++ b/include/linux/if_pppopns.h
+@@ -0,0 +1,32 @@
++/* include/linux/if_pppopns.h
++ *
++ * Header for PPP on PPTP Network Server / PPPoPNS Socket (RFC 2637)
++ *
++ * Copyright (C) 2009 Google, Inc.
++ * Author: Chia-chi Yeh <chiachi@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __LINUX_IF_PPPOPNS_H
++#define __LINUX_IF_PPPOPNS_H
++
++#include <linux/socket.h>
++#include <linux/types.h>
++
++struct sockaddr_pppopns {
++	sa_family_t	sa_family;	/* AF_PPPOX */
++	unsigned int	sa_protocol;	/* PX_PROTO_OPNS */
++	int		tcp_socket;
++	__u16		local;
++	__u16		remote;
++} __attribute__((packed));
++
++#endif /* __LINUX_IF_PPPOPNS_H */
+diff --git a/include/linux/if_pppox.h b/include/linux/if_pppox.h
+index b5f927f..1597b8b 100644
+--- a/include/linux/if_pppox.h
++++ b/include/linux/if_pppox.h
+@@ -28,6 +28,8 @@
+ #include <linux/ppp_channel.h>
+ #endif /* __KERNEL__ */
+ #include <linux/if_pppol2tp.h>
++#include <linux/if_pppolac.h>
++#include <linux/if_pppopns.h>
+ 
+ /* For user-space programs to pick up these definitions
+  * which they wouldn't get otherwise without defining __KERNEL__
+@@ -61,7 +63,9 @@ struct pptp_addr {
+ #define PX_PROTO_OE    0 /* Currently just PPPoE */
+ #define PX_PROTO_OL2TP 1 /* Now L2TP also */
+ #define PX_PROTO_PPTP  2
+-#define PX_MAX_PROTO   3
++#define PX_PROTO_OLAC  3
++#define PX_PROTO_OPNS  4
++#define PX_MAX_PROTO   5
+ 
+ struct sockaddr_pppox {
+ 	__kernel_sa_family_t sa_family;       /* address family, AF_PPPOX */
+@@ -168,6 +172,25 @@ struct pptp_opt {
+ 	u32 seq_sent, seq_recv;
+ 	int ppp_flags;
+ };
++
++struct pppolac_opt {
++	__u32		local;
++	__u32		remote;
++	__u32		recv_sequence;
++	__u32		xmit_sequence;
++	atomic_t	sequencing;
++	int		(*backlog_rcv)(struct sock *sk_udp, struct sk_buff *skb);
++};
++
++struct pppopns_opt {
++	__u16		local;
++	__u16		remote;
++	__u32		recv_sequence;
++	__u32		xmit_sequence;
++	void		(*data_ready)(struct sock *sk_raw, int length);
++	int		(*backlog_rcv)(struct sock *sk_raw, struct sk_buff *skb);
++};
++
+ #include <net/sock.h>
+ 
+ struct pppox_sock {
+@@ -178,6 +201,8 @@ struct pppox_sock {
+ 	union {
+ 		struct pppoe_opt pppoe;
+ 		struct pptp_opt  pptp;
++		struct pppolac_opt lac;
++		struct pppopns_opt pns;
+ 	} proto;
+ 	__be16			num;
+ };

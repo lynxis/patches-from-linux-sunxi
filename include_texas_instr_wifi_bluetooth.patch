@@ -1,0 +1,74 @@
+diff --git a/include/linux/wifi_tiwlan.h b/include/linux/wifi_tiwlan.h
+new file mode 100644
+index 0000000..f07e067
+--- /dev/null
++++ b/include/linux/wifi_tiwlan.h
+@@ -0,0 +1,27 @@
++/* include/linux/wifi_tiwlan.h
++ *
++ * Copyright (C) 2008 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#ifndef _LINUX_WIFI_TIWLAN_H_
++#define _LINUX_WIFI_TIWLAN_H_
++
++#include <linux/wlan_plat.h>
++
++#define WMPA_NUMBER_OF_SECTIONS	3
++#define WMPA_NUMBER_OF_BUFFERS	160
++#define WMPA_SECTION_HEADER	24
++#define WMPA_SECTION_SIZE_0	(WMPA_NUMBER_OF_BUFFERS * 64)
++#define WMPA_SECTION_SIZE_1	(WMPA_NUMBER_OF_BUFFERS * 256)
++#define WMPA_SECTION_SIZE_2	(WMPA_NUMBER_OF_BUFFERS * 2048)
++
++#endif
+diff --git a/include/linux/wl127x-rfkill.h b/include/linux/wl127x-rfkill.h
+new file mode 100644
+index 0000000..9057ec6
+--- /dev/null
++++ b/include/linux/wl127x-rfkill.h
+@@ -0,0 +1,35 @@
++/*
++ * Bluetooth TI wl127x rfkill power control via GPIO
++ *
++ * Copyright (C) 2009 Motorola, Inc.
++ * Copyright (C) 2008 Texas Instruments
++ * Initial code: Pavan Savoy <pavan.savoy@gmail.com> (wl127x_power.c)
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ */
++
++#ifndef _LINUX_WL127X_RFKILL_H
++#define _LINUX_WL127X_RFKILL_H
++
++#include <linux/rfkill.h>
++
++struct wl127x_rfkill_platform_data {
++	int nshutdown_gpio;
++
++	struct rfkill *rfkill;  /* for driver only */
++};
++
++#endif

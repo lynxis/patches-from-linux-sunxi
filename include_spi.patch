@@ -1,0 +1,24 @@
+diff --git a/include/linux/spi/spi.h b/include/linux/spi/spi.h
+index fa702ae..6c8b6aa 100644
+--- a/include/linux/spi/spi.h
++++ b/include/linux/spi/spi.h
+@@ -505,6 +505,7 @@ struct spi_transfer {
+ 	unsigned	cs_change:1;
+ 	u8		bits_per_word;
+ 	u16		delay_usecs;
++	u16		interbyte_usecs;
+ 	u32		speed_hz;
+ 
+ 	struct list_head transfer_list;
+diff --git a/include/linux/spi/spidev.h b/include/linux/spi/spidev.h
+index 52d9ed0..66ff93d 100644
+--- a/include/linux/spi/spidev.h
++++ b/include/linux/spi/spidev.h
+@@ -90,6 +90,7 @@ struct spi_ioc_transfer {
+ 	__u32		speed_hz;
+ 
+ 	__u16		delay_usecs;
++	__u16		interbyte_usecs;
+ 	__u8		bits_per_word;
+ 	__u8		cs_change;
+ 	__u32		pad;

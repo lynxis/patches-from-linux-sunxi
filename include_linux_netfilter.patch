@@ -1,0 +1,97 @@
+diff --git a/include/linux/netfilter/xt_IDLETIMER.h b/include/linux/netfilter/xt_IDLETIMER.h
+index 208ae93..faaa28b 100644
+--- a/include/linux/netfilter/xt_IDLETIMER.h
++++ b/include/linux/netfilter/xt_IDLETIMER.h
+@@ -4,6 +4,7 @@
+  * Header file for Xtables timer target module.
+  *
+  * Copyright (C) 2004, 2010 Nokia Corporation
++ *
+  * Written by Timo Teras <ext-timo.teras@nokia.com>
+  *
+  * Converted to x_tables and forward-ported to 2.6.34
+@@ -32,12 +33,19 @@
+ #include <linux/types.h>
+ 
+ #define MAX_IDLETIMER_LABEL_SIZE 28
++#define NLMSG_MAX_SIZE 64
++
++#define NL_EVENT_TYPE_INACTIVE 0
++#define NL_EVENT_TYPE_ACTIVE 1
+ 
+ struct idletimer_tg_info {
+ 	__u32 timeout;
+ 
+ 	char label[MAX_IDLETIMER_LABEL_SIZE];
+ 
++	/* Use netlink messages for notification in addition to sysfs */
++	__u8 send_nl_msg;
++
+ 	/* for kernel module internal use only */
+ 	struct idletimer_tg *timer __attribute__((aligned(8)));
+ };
+diff --git a/include/linux/netfilter/xt_qtaguid.h b/include/linux/netfilter/xt_qtaguid.h
+new file mode 100644
+index 0000000..ca60fbd
+--- /dev/null
++++ b/include/linux/netfilter/xt_qtaguid.h
+@@ -0,0 +1,13 @@
++#ifndef _XT_QTAGUID_MATCH_H
++#define _XT_QTAGUID_MATCH_H
++
++/* For now we just replace the xt_owner.
++ * FIXME: make iptables aware of qtaguid. */
++#include <linux/netfilter/xt_owner.h>
++
++#define XT_QTAGUID_UID    XT_OWNER_UID
++#define XT_QTAGUID_GID    XT_OWNER_GID
++#define XT_QTAGUID_SOCKET XT_OWNER_SOCKET
++#define xt_qtaguid_match_info xt_owner_match_info
++
++#endif /* _XT_QTAGUID_MATCH_H */
+diff --git a/include/linux/netfilter/xt_quota2.h b/include/linux/netfilter/xt_quota2.h
+new file mode 100644
+index 0000000..eadc690
+--- /dev/null
++++ b/include/linux/netfilter/xt_quota2.h
+@@ -0,0 +1,25 @@
++#ifndef _XT_QUOTA_H
++#define _XT_QUOTA_H
++
++enum xt_quota_flags {
++	XT_QUOTA_INVERT    = 1 << 0,
++	XT_QUOTA_GROW      = 1 << 1,
++	XT_QUOTA_PACKET    = 1 << 2,
++	XT_QUOTA_NO_CHANGE = 1 << 3,
++	XT_QUOTA_MASK      = 0x0F,
++};
++
++struct xt_quota_counter;
++
++struct xt_quota_mtinfo2 {
++	char name[15];
++	u_int8_t flags;
++
++	/* Comparison-invariant */
++	aligned_u64 quota;
++
++	/* Used internally by the kernel */
++	struct xt_quota_counter *master __attribute__((aligned(8)));
++};
++
++#endif /* _XT_QUOTA_H */
+diff --git a/include/linux/netfilter/xt_socket.h b/include/linux/netfilter/xt_socket.h
+index 26d7217..6359456 100644
+--- a/include/linux/netfilter/xt_socket.h
++++ b/include/linux/netfilter/xt_socket.h
+@@ -11,4 +11,10 @@ struct xt_socket_mtinfo1 {
+ 	__u8 flags;
+ };
+ 
++void xt_socket_put_sk(struct sock *sk);
++struct sock *xt_socket_get4_sk(const struct sk_buff *skb,
++			       struct xt_action_param *par);
++struct sock *xt_socket_get6_sk(const struct sk_buff *skb,
++			       struct xt_action_param *par);
++
+ #endif /* _XT_SOCKET_H */

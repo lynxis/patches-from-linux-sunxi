@@ -1,0 +1,39 @@
+diff --git a/include/linux/major.h b/include/linux/major.h
+index 6a8ca98..a06e813 100644
+--- a/include/linux/major.h
++++ b/include/linux/major.h
+@@ -1,3 +1,23 @@
++/*
++ * (C) Copyright 2007-2012
++ * Allwinner Technology Co., Ltd. <www.allwinnertech.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
+ #ifndef _LINUX_MAJOR_H
+ #define _LINUX_MAJOR_H
+ 
+@@ -169,6 +189,10 @@
+ #define IBM_TTY3270_MAJOR	227
+ #define IBM_FS3270_MAJOR	228
+ 
++#define UMP_MAJOR		229
++#define VIOTAPE_MAJOR		230
++#define MALI_MAJOR		230
++
+ #define VIOTAPE_MAJOR		230
+ 
+ #define BLOCK_EXT_MAJOR		259

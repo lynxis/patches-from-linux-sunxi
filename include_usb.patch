@@ -1,0 +1,287 @@
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 4e8e668..e486775 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1039,6 +1039,7 @@ extern int usb_disabled(void);
+ #define URB_SETUP_MAP_LOCAL	0x00200000	/* HCD-local setup packet */
+ #define URB_DMA_SG_COMBINED	0x00400000	/* S-G entries were combined */
+ #define URB_ALIGNED_TEMP_BUFFER	0x00800000	/* Temp buffer was alloc'd */
++#define URB_ALIGNED_TEMP_SETUP	0x01000000	/* Temp setup packet alloc'd */
+ 
+ struct usb_iso_packet_descriptor {
+ 	unsigned int offset;
+diff --git a/include/linux/usb/composite.h b/include/linux/usb/composite.h
+index a316fba..af16097 100644
+--- a/include/linux/usb/composite.h
++++ b/include/linux/usb/composite.h
+@@ -242,6 +242,9 @@ int usb_add_config(struct usb_composite_dev *,
+ 		struct usb_configuration *,
+ 		int (*)(struct usb_configuration *));
+ 
++int usb_remove_config(struct usb_composite_dev *,
++		struct usb_configuration *);
++
+ /**
+  * struct usb_composite_driver - groups configurations into a gadget
+  * @name: For diagnostics, identifies the driver.
+@@ -369,6 +372,27 @@ extern int usb_string_ids_tab(struct usb_composite_dev *c,
+ 			      struct usb_string *str);
+ extern int usb_string_ids_n(struct usb_composite_dev *c, unsigned n);
+ 
++/* add by javen */
++struct android_usb_config{
++    /* usb feature */
++    u32 vendor_id;
++    u32 mass_storage_id;
++    u32 adb_id;
++
++    char usb_manufacturer_name[64];
++    char usb_product_name[64];
++    char usb_serial_number[64];
++
++    /* usb_mass_storage feature */
++    char msc_vendor_name[64];
++    char msc_product_name[64];
++    u32 msc_release;
++    u32 luns;
++};
++
++s32 parse_android_usb_config(void);
++s32 get_android_usb_config(struct android_usb_config *config);
++
+ 
+ /* messaging utils */
+ #define DBG(d, fmt, args...) \
+diff --git a/include/linux/usb/f_accessory.h b/include/linux/usb/f_accessory.h
+new file mode 100644
+index 0000000..61ebe0a
+--- /dev/null
++++ b/include/linux/usb/f_accessory.h
+@@ -0,0 +1,146 @@
++/*
++ * Gadget Function Driver for Android USB accessories
++ *
++ * Copyright (C) 2011 Google, Inc.
++ * Author: Mike Lockwood <lockwood@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __LINUX_USB_F_ACCESSORY_H
++#define __LINUX_USB_F_ACCESSORY_H
++
++/* Use Google Vendor ID when in accessory mode */
++#define USB_ACCESSORY_VENDOR_ID 0x18D1
++
++
++/* Product ID to use when in accessory mode */
++#define USB_ACCESSORY_PRODUCT_ID 0x2D00
++
++/* Product ID to use when in accessory mode and adb is enabled */
++#define USB_ACCESSORY_ADB_PRODUCT_ID 0x2D01
++
++/* Indexes for strings sent by the host via ACCESSORY_SEND_STRING */
++#define ACCESSORY_STRING_MANUFACTURER   0
++#define ACCESSORY_STRING_MODEL          1
++#define ACCESSORY_STRING_DESCRIPTION    2
++#define ACCESSORY_STRING_VERSION        3
++#define ACCESSORY_STRING_URI            4
++#define ACCESSORY_STRING_SERIAL         5
++
++/* Control request for retrieving device's protocol version
++ *
++ *	requestType:    USB_DIR_IN | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_GET_PROTOCOL
++ *	value:          0
++ *	index:          0
++ *	data            version number (16 bits little endian)
++ *                     1 for original accessory support
++ *                     2 adds HID and device to host audio support
++ */
++#define ACCESSORY_GET_PROTOCOL  51
++
++/* Control request for host to send a string to the device
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_SEND_STRING
++ *	value:          0
++ *	index:          string ID
++ *	data            zero terminated UTF8 string
++ *
++ *  The device can later retrieve these strings via the
++ *  ACCESSORY_GET_STRING_* ioctls
++ */
++#define ACCESSORY_SEND_STRING   52
++
++/* Control request for starting device in accessory mode.
++ * The host sends this after setting all its strings to the device.
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_START
++ *	value:          0
++ *	index:          0
++ *	data            none
++ */
++#define ACCESSORY_START         53
++
++/* Control request for registering a HID device.
++ * Upon registering, a unique ID is sent by the accessory in the
++ * value parameter. This ID will be used for future commands for
++ * the device
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_REGISTER_HID_DEVICE
++ *	value:          Accessory assigned ID for the HID device
++ *	index:          total length of the HID report descriptor
++ *	data            none
++ */
++#define ACCESSORY_REGISTER_HID         54
++
++/* Control request for unregistering a HID device.
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_REGISTER_HID
++ *	value:          Accessory assigned ID for the HID device
++ *	index:          0
++ *	data            none
++ */
++#define ACCESSORY_UNREGISTER_HID         55
++
++/* Control request for sending the HID report descriptor.
++ * If the HID descriptor is longer than the endpoint zero max packet size,
++ * the descriptor will be sent in multiple ACCESSORY_SET_HID_REPORT_DESC
++ * commands. The data for the descriptor must be sent sequentially
++ * if multiple packets are needed.
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_SET_HID_REPORT_DESC
++ *	value:          Accessory assigned ID for the HID device
++ *	index:          offset of data in descriptor
++ *                      (needed when HID descriptor is too big for one packet)
++ *	data            the HID report descriptor
++ */
++#define ACCESSORY_SET_HID_REPORT_DESC         56
++
++/* Control request for sending HID events.
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_SEND_HID_EVENT
++ *	value:          Accessory assigned ID for the HID device
++ *	index:          0
++ *	data            the HID report for the event
++ */
++#define ACCESSORY_SEND_HID_EVENT         57
++
++/* Control request for setting the audio mode.
++ *
++ *	requestType:	USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_SET_AUDIO_MODE
++ *	value:          0 - no audio
++ *                     1 - device to host, 44100 16-bit stereo PCM
++ *	index:          0
++ *	data            none
++ */
++#define ACCESSORY_SET_AUDIO_MODE         58
++
++/* ioctls for retrieving strings set by the host */
++#define ACCESSORY_GET_STRING_MANUFACTURER   _IOW('M', 1, char[256])
++#define ACCESSORY_GET_STRING_MODEL          _IOW('M', 2, char[256])
++#define ACCESSORY_GET_STRING_DESCRIPTION    _IOW('M', 3, char[256])
++#define ACCESSORY_GET_STRING_VERSION        _IOW('M', 4, char[256])
++#define ACCESSORY_GET_STRING_URI            _IOW('M', 5, char[256])
++#define ACCESSORY_GET_STRING_SERIAL         _IOW('M', 6, char[256])
++/* returns 1 if there is a start request pending */
++#define ACCESSORY_IS_START_REQUESTED        _IO('M', 7)
++/* returns audio mode (set via the ACCESSORY_SET_AUDIO_MODE control request) */
++#define ACCESSORY_GET_AUDIO_MODE            _IO('M', 8)
++
++#endif /* __LINUX_USB_F_ACCESSORY_H */
+diff --git a/include/linux/usb/f_mtp.h b/include/linux/usb/f_mtp.h
+new file mode 100644
+index 0000000..72a432e
+--- /dev/null
++++ b/include/linux/usb/f_mtp.h
+@@ -0,0 +1,75 @@
++/*
++ * Gadget Function Driver for MTP
++ *
++ * Copyright (C) 2010 Google, Inc.
++ * Author: Mike Lockwood <lockwood@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef __LINUX_USB_F_MTP_H
++#define __LINUX_USB_F_MTP_H
++
++#include <linux/ioctl.h>
++
++#ifdef __KERNEL__
++
++struct mtp_data_header {
++	/* length of packet, including this header */
++	uint32_t	length;
++	/* container type (2 for data packet) */
++	uint16_t	type;
++	/* MTP command code */
++	uint16_t    command;
++	/* MTP transaction ID */
++	uint32_t	transaction_id;
++};
++
++#endif /* __KERNEL__ */
++
++struct mtp_file_range {
++	/* file descriptor for file to transfer */
++	int			fd;
++	/* offset in file for start of transfer */
++	loff_t		offset;
++	/* number of bytes to transfer */
++	int64_t		length;
++	/* MTP command ID for data header,
++	 * used only for MTP_SEND_FILE_WITH_HEADER
++	 */
++	uint16_t	command;
++	/* MTP transaction ID for data header,
++	 * used only for MTP_SEND_FILE_WITH_HEADER
++	 */
++	uint32_t	transaction_id;
++};
++
++struct mtp_event {
++	/* size of the event */
++	size_t		length;
++	/* event data to send */
++	void		*data;
++};
++
++/* Sends the specified file range to the host */
++#define MTP_SEND_FILE              _IOW('M', 0, struct mtp_file_range)
++/* Receives data from the host and writes it to a file.
++ * The file is created if it does not exist.
++ */
++#define MTP_RECEIVE_FILE           _IOW('M', 1, struct mtp_file_range)
++/* Sends an event to the host via the interrupt endpoint */
++#define MTP_SEND_EVENT             _IOW('M', 3, struct mtp_event)
++/* Sends the specified file range to the host,
++ * with a 12 byte MTP data packet header at the beginning.
++ */
++#define MTP_SEND_FILE_WITH_HEADER  _IOW('M', 4, struct mtp_file_range)
++
++#endif /* __LINUX_USB_F_MTP_H */

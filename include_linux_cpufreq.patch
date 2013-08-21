@@ -1,0 +1,77 @@
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index b60f6ba..d17c450 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -167,6 +167,9 @@ static inline unsigned long cpufreq_scale(unsigned long old, u_int div, u_int mu
+ #define CPUFREQ_GOV_START  1
+ #define CPUFREQ_GOV_STOP   2
+ #define CPUFREQ_GOV_LIMITS 3
++#ifdef CONFIG_CPU_FREQ_USR_EVNT_NOTIFY
++#define CPUFREQ_GOV_USRENET 4
++#endif
+ 
+ struct cpufreq_governor {
+ 	char	name[CPUFREQ_NAME_LEN];
+@@ -254,7 +257,10 @@ int cpufreq_unregister_driver(struct cpufreq_driver *driver_data);
+ 
+ 
+ void cpufreq_notify_transition(struct cpufreq_freqs *freqs, unsigned int state);
+-
++#ifdef CONFIG_CPU_FREQ_USR_EVNT_NOTIFY
++/* user event notification */
++void cpufreq_user_event_notify(void);
++#endif
+ 
+ static inline void cpufreq_verify_within_limits(struct cpufreq_policy *policy, unsigned int min, unsigned int max)
+ {
+@@ -364,6 +370,12 @@ extern struct cpufreq_governor cpufreq_gov_ondemand;
+ #elif defined(CONFIG_CPU_FREQ_DEFAULT_GOV_CONSERVATIVE)
+ extern struct cpufreq_governor cpufreq_gov_conservative;
+ #define CPUFREQ_DEFAULT_GOVERNOR	(&cpufreq_gov_conservative)
++#elif defined(CONFIG_CPU_FREQ_DEFAULT_GOV_INTERACTIVE)
++extern struct cpufreq_governor cpufreq_gov_interactive;
++#define CPUFREQ_DEFAULT_GOVERNOR	(&cpufreq_gov_interactive)
++#elif defined(CONFIG_CPU_FREQ_DEFAULT_GOV_FANTASY)
++extern struct cpufreq_governor cpufreq_gov_fantasy;
++#define CPUFREQ_DEFAULT_GOVERNOR	(&cpufreq_gov_fantasy)
+ #endif
+ 
+ 
+diff --git a/include/linux/cpuidle.h b/include/linux/cpuidle.h
+index 6c26a3d..5ab7183 100644
+--- a/include/linux/cpuidle.h
++++ b/include/linux/cpuidle.h
+@@ -57,6 +57,7 @@ struct cpuidle_state {
+ 
+ /* Idle State Flags */
+ #define CPUIDLE_FLAG_TIME_VALID	(0x01) /* is residency time measurable? */
++#define CPUIDLE_FLAG_COUPLED	(0x02) /* state applies to multiple cpus */
+ 
+ #define CPUIDLE_DRIVER_FLAGS_MASK (0xFFFF0000)
+ 
+@@ -100,6 +101,12 @@ struct cpuidle_device {
+ 	struct list_head 	device_list;
+ 	struct kobject		kobj;
+ 	struct completion	kobj_unregister;
++
++#ifdef CONFIG_ARCH_NEEDS_CPU_IDLE_COUPLED
++	int			safe_state_index;
++	cpumask_t		coupled_cpus;
++	struct cpuidle_coupled	*coupled;
++#endif
+ };
+ 
+ DECLARE_PER_CPU(struct cpuidle_device *, cpuidle_devices);
+@@ -176,6 +183,10 @@ static inline int cpuidle_play_dead(void) {return -ENODEV; }
+ 
+ #endif
+ 
++#ifdef CONFIG_ARCH_NEEDS_CPU_IDLE_COUPLED
++void cpuidle_coupled_parallel_barrier(struct cpuidle_device *dev, atomic_t *a);
++#endif
++
+ /******************************
+  * CPUIDLE GOVERNOR INTERFACE *
+  ******************************/
+diff --git a/include/linux/dma-buf.h b/include/linux/dma-buf.h
+index 3efbfc2..1f78d15 100644
