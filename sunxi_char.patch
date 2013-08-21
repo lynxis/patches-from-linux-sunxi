@@ -1,0 +1,3018 @@
+diff --git a/drivers/char/Kconfig b/drivers/char/Kconfig
+index ee946865..e775f75 100644
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -612,5 +629,7 @@ config TILE_SROM
+ 	  device appear much like a simple EEPROM, and knows
+ 	  how to partition a single ROM for multiple purposes.
+ 
++source "drivers/char/sun4i_g2d/Kconfig"
++
+ endmenu
+ 
+diff --git a/drivers/char/Makefile b/drivers/char/Makefile
+index 0dc5d7c..70a3058 100644
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -57,10 +57,11 @@ obj-$(CONFIG_IPMI_HANDLER)	+= ipmi/
+ obj-$(CONFIG_HANGCHECK_TIMER)	+= hangcheck-timer.o
+ obj-$(CONFIG_TCG_TPM)		+= tpm/
+ 
+ obj-$(CONFIG_PS3_FLASH)		+= ps3flash.o
+ obj-$(CONFIG_RAMOOPS)		+= ramoops.o
+ 
+ obj-$(CONFIG_JS_RTC)		+= js-rtc.o
++obj-$(CONFIG_SUN4I_G2D) += sun4i_g2d/
+ js-rtc-y = rtc.o
+ 
+ obj-$(CONFIG_TILE_SROM)		+= tile-srom.o
+diff --git a/drivers/char/sun4i_g2d/Kconfig b/drivers/char/sun4i_g2d/Kconfig
+new file mode 100644
+index 0000000..b35eb39
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/Kconfig
+@@ -0,0 +1,9 @@
++
++config SUN4I_G2D
++	depends on ARCH_SUN4I
++	tristate "SUN4I G2D"
++	default y
++#	depends on HAS_IOMEM
++	help
++
++
+diff --git a/drivers/char/sun4i_g2d/Makefile b/drivers/char/sun4i_g2d/Makefile
+new file mode 100644
+index 0000000..f847f517
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/Makefile
+@@ -0,0 +1,7 @@
++#
++# Makefile for the kernel mixer device drivers.
++#
++
++obj-$(CONFIG_SUN4I_G2D) 	+= g2d_23.o
++
++g2d_23-objs	:= g2d_driver.o g2d.o g2d_bsp.o
+diff --git a/drivers/char/sun4i_g2d/g2d.c b/drivers/char/sun4i_g2d/g2d.c
+new file mode 100644
+index 0000000..2eebfd9
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/g2d.c
+@@ -0,0 +1,320 @@
++/*
++ * drivers/char/sun4i_g2d/g2d.c
++ *
++ * (C) Copyright 2007-2012
++ * Allwinner Technology Co., Ltd. <www.allwinnertech.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include "g2d.h"
++#include <linux/clk.h>
++#include <linux/interrupt.h>
++#include <mach/clock.h>
++#include "g2d_driver_i.h"
++
++struct clk *g2d_ahbclk,*g2d_dramclk,*g2d_mclk,*g2d_src;
++extern __g2d_drv_t	 g2d_ext_hd;
++
++int g2d_openclk(void)
++{
++	__u32 ret;
++
++	/* ahb g2d gating */
++	g2d_ahbclk = clk_get(NULL,"ahb_de_mix");
++
++	/* sdram g2d gating */
++	g2d_dramclk = clk_get(NULL,"sdram_de_mix");
++
++	/* g2d gating */
++	g2d_mclk = clk_get(NULL,"de_mix");
++
++	/*disable mp clk reset*/
++	clk_reset(g2d_mclk,0);
++
++	/* set g2d clk value */
++	g2d_src = clk_get(NULL,"sdram_pll_p");//video_pll0
++	ret = clk_set_parent(g2d_mclk, g2d_src);
++	clk_put(g2d_src);
++
++	ret = clk_get_rate(g2d_src);
++	clk_set_rate(g2d_mclk,ret/2);
++
++	return 0;
++}
++
++int g2d_closeclk(void)/* used once when g2d driver exit */
++{
++	clk_disable(g2d_ahbclk);
++	clk_disable(g2d_dramclk);
++	clk_disable(g2d_mclk);
++
++	clk_put(g2d_ahbclk);
++	clk_put(g2d_dramclk);
++	clk_put(g2d_mclk);
++
++	return 0;
++}
++
++int g2d_clk_on(void)/* used in request */
++{
++	clk_enable(g2d_ahbclk);
++	clk_enable(g2d_dramclk);
++	clk_enable(g2d_mclk);
++
++	return  0;
++}
++
++int g2d_clk_off(void)/* used in release */
++{
++	clk_disable(g2d_ahbclk);
++	clk_disable(g2d_dramclk);
++	clk_disable(g2d_mclk);
++
++	return  0;
++}
++
++irqreturn_t g2d_handle_irq(int irq, void *dev_id)
++{
++    __u32 irq_flag;
++
++    irq_flag = mixer_get_irq();
++    if(irq_flag & G2D_FINISH_IRQ)
++    {
++		mixer_clear_init();
++		g2d_ext_hd.finish_flag = 1;
++		wake_up(&g2d_ext_hd.queue);
++    }
++
++    return IRQ_HANDLED;
++}
++
++int g2d_init(g2d_init_para *para)
++{
++	mixer_set_reg_base(para->g2d_base);
++
++	return 0;
++}
++
++int g2d_exit(void)
++{
++	__u8 err = 0;
++	g2d_closeclk();
++
++	return err;
++}
++
++int g2d_wait_cmd_finish(void)
++{
++	long timeout = 50; /* 30ms */
++
++	timeout = wait_event_timeout(g2d_ext_hd.queue, g2d_ext_hd.finish_flag == 1, msecs_to_jiffies(timeout));
++	if(timeout == 0)
++	{
++		mixer_clear_init();
++		printk("wait g2d irq pending flag timeout\n");
++		g2d_ext_hd.finish_flag = 1;
++		wake_up(&g2d_ext_hd.queue);
++		return -1;
++	}
++	return 0;
++}
++
++int g2d_blit(g2d_blt * para)
++{
++	__s32 err = 0;
++
++	/* check the parameter valid */
++    if(((para->src_rect.x < 0)&&((-para->src_rect.x) > para->src_rect.w)) ||
++       ((para->src_rect.y < 0)&&((-para->src_rect.y) > para->src_rect.h)) ||
++       ((para->dst_x < 0)&&((-para->dst_x) > para->src_rect.w)) ||
++       ((para->dst_y < 0)&&((-para->dst_y) > para->src_rect.h)) ||
++       ((para->src_rect.x > 0)&&(para->src_rect.x > para->src_image.w - 1)) ||
++       ((para->src_rect.y > 0)&&(para->src_rect.y > para->src_image.h - 1)) ||
++       ((para->dst_x > 0)&&(para->dst_x > para->dst_image.w - 1)) ||
++       ((para->dst_y > 0)&&(para->dst_y > para->dst_image.h - 1)))
++	{
++		printk("invalid blit parameter setting");
++		return -EINVAL;
++	}
++	else
++	{
++		if(((para->src_rect.x < 0)&&((-para->src_rect.x) < para->src_rect.w)))
++		{
++			para->src_rect.w = para->src_rect.w + para->src_rect.x;
++			para->src_rect.x = 0;
++		}
++		else if((para->src_rect.x + para->src_rect.w) > para->src_image.w)
++		{
++			para->src_rect.w = para->src_image.w - para->src_rect.x;
++		}
++		if(((para->src_rect.y < 0)&&((-para->src_rect.y) < para->src_rect.h)))
++		{
++			para->src_rect.h = para->src_rect.h + para->src_rect.y;
++			para->src_rect.y = 0;
++		}
++		else if((para->src_rect.y + para->src_rect.h) > para->src_image.h)
++		{
++			para->src_rect.h = para->src_image.h - para->src_rect.y;
++		}
++
++		if(((para->dst_x < 0)&&((-para->dst_x) < para->src_rect.w)))
++		{
++			para->src_rect.w = para->src_rect.w + para->dst_x;
++			para->src_rect.x = (-para->dst_x);
++			para->dst_x = 0;
++		}
++		else if((para->dst_x + para->src_rect.w) > para->dst_image.w)
++		{
++			para->src_rect.w = para->dst_image.w - para->dst_x;
++		}
++		if(((para->dst_y < 0)&&((-para->dst_y) < para->src_rect.h)))
++		{
++			para->src_rect.h = para->src_rect.h + para->dst_y;
++			para->src_rect.y = (-para->dst_y);
++			para->dst_y = 0;
++		}
++		else if((para->dst_y + para->src_rect.h) > para->dst_image.h)
++		{
++			para->src_rect.h = para->dst_image.h - para->dst_y;
++		}
++	}
++
++	g2d_ext_hd.finish_flag = 0;
++	err = mixer_blt(para);
++
++	return err;
++}
++
++int g2d_fill(g2d_fillrect * para)
++{
++	__s32 err = 0;
++
++	/* check the parameter valid */
++	if(((para->dst_rect.x < 0)&&((-para->dst_rect.x)>para->dst_rect.w)) ||
++	   ((para->dst_rect.y < 0)&&((-para->dst_rect.y)>para->dst_rect.h)) ||
++	   ((para->dst_rect.x > 0)&&(para->dst_rect.x > para->dst_image.w - 1)) ||
++	   ((para->dst_rect.y > 0)&&(para->dst_rect.y > para->dst_image.h - 1)))
++	{
++		printk("invalid fillrect parameter setting");
++		return -EINVAL;
++	}
++	else
++	{
++		if(((para->dst_rect.x < 0)&&((-para->dst_rect.x) < para->dst_rect.w)))
++		{
++			para->dst_rect.w = para->dst_rect.w + para->dst_rect.x;
++			para->dst_rect.x = 0;
++		}
++		else if((para->dst_rect.x + para->dst_rect.w) > para->dst_image.w)
++		{
++			para->dst_rect.w = para->dst_image.w - para->dst_rect.x;
++		}
++		if(((para->dst_rect.y < 0)&&((-para->dst_rect.y) < para->dst_rect.h)))
++		{
++			para->dst_rect.h = para->dst_rect.h + para->dst_rect.y;
++			para->dst_rect.y = 0;
++		}
++		else if((para->dst_rect.y + para->dst_rect.h) > para->dst_image.h)
++		{
++			para->dst_rect.h = para->dst_image.h - para->dst_rect.y;
++		}
++	}
++
++	g2d_ext_hd.finish_flag = 0;
++	err = mixer_fillrectangle(para);
++
++	return err;
++}
++
++int g2d_stretchblit(g2d_stretchblt * para)
++{
++	__s32 err = 0;
++
++	/* check the parameter valid */
++    if(((para->src_rect.x < 0)&&((-para->src_rect.x) > para->src_rect.w)) ||
++       ((para->src_rect.y < 0)&&((-para->src_rect.y) > para->src_rect.h)) ||
++       ((para->dst_rect.x < 0)&&((-para->dst_rect.x) > para->dst_rect.w)) ||
++       ((para->dst_rect.y < 0)&&((-para->dst_rect.y) > para->dst_rect.h)) ||
++       ((para->src_rect.x > 0)&&(para->src_rect.x > para->src_image.w - 1)) ||
++       ((para->src_rect.y > 0)&&(para->src_rect.y > para->src_image.h - 1)) ||
++       ((para->dst_rect.x > 0)&&(para->dst_rect.x > para->dst_image.w - 1)) ||
++       ((para->dst_rect.y > 0)&&(para->dst_rect.y > para->dst_image.h - 1)))
++	{
++		printk("invalid stretchblit parameter setting");
++		return -EINVAL;
++	}
++	else
++	{
++		if(((para->src_rect.x < 0)&&((-para->src_rect.x) < para->src_rect.w)))
++		{
++			para->src_rect.w = para->src_rect.w + para->src_rect.x;
++			para->src_rect.x = 0;
++		}
++		else if((para->src_rect.x + para->src_rect.w) > para->src_image.w)
++		{
++			para->src_rect.w = para->src_image.w - para->src_rect.x;
++		}
++		if(((para->src_rect.y < 0)&&((-para->src_rect.y) < para->src_rect.h)))
++		{
++			para->src_rect.h = para->src_rect.h + para->src_rect.y;
++			para->src_rect.y = 0;
++		}
++		else if((para->src_rect.y + para->src_rect.h) > para->src_image.h)
++		{
++			para->src_rect.h = para->src_image.h - para->src_rect.y;
++		}
++
++		if(((para->dst_rect.x < 0)&&((-para->dst_rect.x) < para->dst_rect.w)))
++		{
++			para->dst_rect.w = para->dst_rect.w + para->dst_rect.x;
++			para->dst_rect.x = 0;
++		}
++		else if((para->dst_rect.x + para->dst_rect.w) > para->dst_image.w)
++		{
++			para->dst_rect.w = para->dst_image.w - para->dst_rect.x;
++		}
++		if(((para->dst_rect.y < 0)&&((-para->dst_rect.y) < para->dst_rect.h)))
++		{
++			para->dst_rect.h = para->dst_rect.h + para->dst_rect.y;
++			para->dst_rect.y = 0;
++		}
++		else if((para->dst_rect.y + para->dst_rect.h) > para->dst_image.h)
++		{
++			para->dst_rect.h = para->dst_image.h - para->dst_rect.y;
++		}
++	}
++
++	g2d_ext_hd.finish_flag = 0;
++	err = mixer_stretchblt(para);
++
++	return err;
++}
++
++int g2d_set_palette_table(g2d_palette *para)
++{
++
++    if((para->pbuffer == NULL) || (para->size < 0) || (para->size>1024))
++    {
++        printk("para invalid in mixer_set_palette\n");
++        return -1;
++    }
++
++	mixer_set_palette(para);
++
++	return 0;
++}
++
+diff --git a/drivers/char/sun4i_g2d/g2d.h b/drivers/char/sun4i_g2d/g2d.h
+new file mode 100644
+index 0000000..f848ecd
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/g2d.h
+@@ -0,0 +1,51 @@
++/*
++ * drivers/char/sun4i_g2d/g2d.h
++ *
++ * (C) Copyright 2007-2012
++ * Allwinner Technology Co., Ltd. <www.allwinnertech.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++
++#ifndef __G2D_H__
++#define __G2D_H__
++
++#include"g2d_bsp.h"
++
++/* Mixer status select */
++#define G2D_FINISH_IRQ		(1<<8)
++#define G2D_ERROR_IRQ		(1<<9)
++
++typedef struct
++{
++	g2d_init_para init_para;
++
++}g2d_dev_t;
++
++int g2d_openclk(void);
++int g2d_closeclk(void);
++int g2d_clk_on(void);
++int g2d_clk_off(void);
++irqreturn_t g2d_handle_irq(int irq, void *dev_id);
++int g2d_init(g2d_init_para *para);
++int g2d_blit(g2d_blt * para);
++int g2d_fill(g2d_fillrect * para);
++int g2d_stretchblit(g2d_stretchblt * para);
++int g2d_set_palette_table(g2d_palette *para);
++int g2d_wait_cmd_finish(void);
++
++#endif/* __G2D_H__ */
+\ No newline at end of file
+diff --git a/drivers/char/sun4i_g2d/g2d_bsp.c b/drivers/char/sun4i_g2d/g2d_bsp.c
+new file mode 100644
+index 0000000..f0c1d3a
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/g2d_bsp.c
+@@ -0,0 +1,1391 @@
++/* g2d_bsp.c
++ *
++ * Copyright (c)	2011 xxxx Electronics
++ *					2011 Yupu Tang
++ *
++ * @ F23 G2D driver
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307USA
++ */
++
++#include "g2d_regs.h"
++#include "g2d_bsp.h"
++#include "g2d.h"
++
++static	__u32	base_addr;
++
++#define read_bvalue(offset)			get_bvalue(base_addr + offset)			/* byte input */
++#define write_bvalue(offset,value)	put_bvalue(base_addr + offset,value)	/* byte output */
++#define read_hvalue(offset)			get_hvalue(base_addr + offset)			/* half word input */
++#define write_hvalue(offset,value)	put_hvalue(base_addr + offset,value)	/* half word output */
++#define read_wvalue(offset)			get_wvalue(base_addr + offset)			/* word input */
++#define write_wvalue(offset,value)	put_wvalue(base_addr + offset,value)	/* word output */
++
++__s32 csc0coeff[12]=
++{
++	0x4a7,0x1e6f,0x1cbf,0x877,
++	0x4a7,0x00,  0x662,	0x3211,
++	0x4a7,0x812, 0x00,	0x2eb1
++};
++__s32 csc1coeff[12]=
++{
++	0x4a7,0x1e6f,0x1cbf,0x877,
++	0x4a7,0x00,  0x662,	0x3211,
++	0x4a7,0x812, 0x00,	0x2eb1
++};
++
++__s32 csc2coeff[12]=
++{
++	0x204,0x107,0x64,0x100,		/* YG,YR,YB,YC */
++	0x1ED6,0x1F69,0x1C1,0x800,	/* UG,UR,UB,UC */
++	0x1E87,0x1C1,0x1FB8,0x800,	/* VG,VR,VB,VC */
++};
++
++__s32 csc2coeff_VUVU[12]=
++{
++	0x204,0x107,0x64,0x100,		/* YG,YR,YB,YC */
++	0x1E87,0x1C1,0x1FB8,0x800,	/* VG,VR,VB,VC */
++	0x1ED6,0x1F69,0x1C1,0x800,	/* UG,UR,UB,UC */
++};
++
++__s32 scalercoeff[64]=
++{
++	/* Horizontal Filtering Coefficient(0x200-0x27c) */
++	0x00004000,0x000140ff,0x00033ffe,0x00043ffd,0x00063efc,0xff083dfc,0x000a3bfb,0xff0d39fb,
++	0xff0f37fb,0xff1136fa,0xfe1433fb,0xfe1631fb,0xfd192ffb,0xfd1c2cfb,0xfd1f29fb,0xfc2127fc,
++	0xfc2424fc,0xfc2721fc,0xfb291ffd,0xfb2c1cfd,0xfb2f19fd,0xfb3116fe,0xfb3314fe,0xfa3611ff,
++	0xfb370fff,0xfb390dff,0xfb3b0a00,0xfc3d08ff,0xfc3e0600,0xfd3f0400,0xfe3f0300,0xff400100,
++
++	/* Vertical Filtering Coefficient(0x280-0x2fc) */
++	0x00004000,0x000140ff,0x00033ffe,0x00043ffd,0x00063efc,0xff083dfc,0x000a3bfb,0xff0d39fb,
++	0xff0f37fb,0xff1136fa,0xfe1433fb,0xfe1631fb,0xfd192ffb,0xfd1c2cfb,0xfd1f29fb,0xfc2127fc,
++	0xfc2424fc,0xfc2721fc,0xfb291ffd,0xfb2c1cfd,0xfb2f19fd,0xfb3116fe,0xfb3314fe,0xfa3611ff,
++	0xfb370fff,0xfb390dff,0xfb3b0a00,0xfc3d08ff,0xfc3e0600,0xfd3f0400,0xfe3f0300,0xff400100,
++};
++
++/* Set the Color Space Converter Coefficient Parameter */
++void csc_coeff_set(void){
++	__u32 i,j;
++
++	/* 0x180-0x1ac */
++	for(i=0, j=0; i<12; i++,j+=4)
++		write_wvalue(G2D_CSC01_ADDR_REG + j, (((csc1coeff[i]&0xFFFF)<<16) | (csc0coeff[i]&0xFFFF)));
++
++	/* 0x1c0-0x1ec */
++	for(i=0, j=0; i<12; i++,j+=4)
++		write_wvalue(G2D_CSC2_ADDR_REG + j, csc2coeff[i]&0xFFFF);
++
++}
++
++/* Set the Scaling Horizontal/Vertical Filtering Coefficient Parameter */
++void scaler_coeff_set(void){
++	__u32 i,j;
++
++	/* 0x200-0x2fc */
++	for(i=0, j=0; i<64; i++,j+=4)
++		write_wvalue(G2D_SCALER_HFILTER_REG + j, scalercoeff[i]);
++
++}
++
++__u32 mixer_set_reg_base(__u32 addr){
++	base_addr = addr;
++	return 0;
++}
++
++/* clear most of the registers value to default */
++__u32 mixer_reg_init(void){
++	__u32 i;
++
++    for(i=0;i<=0x120;i+=4)
++    	write_wvalue(i, 0);
++
++    /* initial the color space converter parameter */
++    csc_coeff_set();
++
++    /* initial the scaler coefficient parameter */
++    scaler_coeff_set();
++
++	return 0;
++}
++
++__u32 mixer_set_fillcolor(__u32 color, __u32 sel){
++	__u32 value;
++
++	if(sel == 1){
++		value = read_wvalue(G2D_DMA1_CONTROL_REG) | G2D_FILL_ENABLE;
++		write_wvalue(G2D_DMA1_CONTROL_REG, value);
++		write_wvalue(G2D_DMA1_FILLCOLOR_REG, color);
++		}
++	else if(sel == 2){
++		value = read_wvalue(G2D_DMA2_CONTROL_REG) | G2D_FILL_ENABLE;
++		write_wvalue(G2D_DMA2_CONTROL_REG, value);
++		write_wvalue(G2D_DMA2_FILLCOLOR_REG, color);
++		}
++	else if(sel == 3){
++		value = read_wvalue(G2D_DMA3_CONTROL_REG) | G2D_FILL_ENABLE;
++		write_wvalue(G2D_DMA3_CONTROL_REG, value);
++		write_wvalue(G2D_DMA3_FILLCOLOR_REG, color);
++		}
++	else	{
++		value = read_wvalue(G2D_DMA0_CONTROL_REG) | G2D_FILL_ENABLE;
++		write_wvalue(G2D_DMA0_CONTROL_REG, value);
++		write_wvalue(G2D_DMA0_FILLCOLOR_REG, color);
++		}
++
++	return 0;
++}
++
++__u32 mixer_bpp_count(__u32 format)
++{
++	__u32 bpp = 32;
++	switch (format)
++	{
++		case G2D_FMT_1BPP_MONO:
++		case G2D_FMT_1BPP_PALETTE:
++			bpp = 1;break;
++
++		case G2D_FMT_2BPP_MONO:
++		case G2D_FMT_2BPP_PALETTE:
++			bpp = 2;break;
++
++		case G2D_FMT_4BPP_MONO:
++		case G2D_FMT_4BPP_PALETTE:
++			bpp = 4;break;
++
++		case G2D_FMT_8BPP_MONO:
++		case G2D_FMT_8BPP_PALETTE:
++		case G2D_FMT_PYUV422UVC:
++		case G2D_FMT_PYUV420UVC:
++		case G2D_FMT_PYUV411UVC:
++		case G2D_FMT_PYUV422:
++		case G2D_FMT_PYUV420:
++		case G2D_FMT_PYUV411:
++			bpp = 8;break;
++
++		case G2D_FMT_IYUV422:
++		case G2D_FMT_RGB565:
++		case G2D_FMT_BGR565:
++		case G2D_FMT_ARGB1555:
++		case G2D_FMT_ABGR1555:
++		case G2D_FMT_RGBA5551:
++		case G2D_FMT_BGRA5551:
++		case G2D_FMT_ARGB4444:
++		case G2D_FMT_ABGR4444:
++		case G2D_FMT_RGBA4444:
++		case G2D_FMT_BGRA4444:
++			bpp = 16;break;
++
++		case G2D_FMT_ARGB_AYUV8888:
++		case G2D_FMT_BGRA_VUYA8888:
++		case G2D_FMT_ABGR_AVUY8888:
++		case G2D_FMT_RGBA_YUVA8888:
++		case G2D_FMT_XRGB8888:
++		case G2D_FMT_BGRX8888:
++		case G2D_FMT_XBGR8888:
++		case G2D_FMT_RGBX8888:
++			bpp = 32;break;
++
++		default:
++			bpp = 32;break;
++	}
++	return bpp;
++
++}
++
++__u32 mixer_in_fmtseq_set(__u32 format,__u32 pixel_seq)
++{
++	__u32 val = 32;
++	switch (format)
++	{
++		case G2D_FMT_1BPP_MONO:
++		case G2D_FMT_1BPP_PALETTE:
++			if	   (pixel_seq == G2D_SEQ_1BPP_LITTER_LITTER)
++				val = 0x3A;
++			else if(pixel_seq == G2D_SEQ_1BPP_BIG_LITTER)
++				val = 0x1A;
++			else if(pixel_seq == G2D_SEQ_1BPP_LITTER_BIG)
++				val = 0x2A;
++			else
++				val = 0xA;
++			break;
++
++		case G2D_FMT_2BPP_MONO:
++		case G2D_FMT_2BPP_PALETTE:
++			if	   (pixel_seq == G2D_SEQ_2BPP_LITTER_LITTER)
++				val = 0x39;
++			else if(pixel_seq == G2D_SEQ_2BPP_BIG_LITTER)
++				val = 0x19;
++			else if(pixel_seq == G2D_SEQ_2BPP_LITTER_BIG)
++				val = 0x29;
++			else
++				val = 0x9;
++			break;
++
++		case G2D_FMT_4BPP_MONO:
++		case G2D_FMT_4BPP_PALETTE:
++			if	   (pixel_seq == G2D_SEQ_P01234567)
++				val = 0x38;
++			else if(pixel_seq == G2D_SEQ_P67452301)
++				val = 0x18;
++			else if(pixel_seq == G2D_SEQ_P10325476)
++				val = 0x28;
++			else
++				val = 0x8;
++			break;
++
++		case G2D_FMT_8BPP_MONO:
++		case G2D_FMT_8BPP_PALETTE:
++			if(pixel_seq == G2D_SEQ_P0123)
++				val = 0x17;
++			else
++				val = 0x7;
++			break;
++
++		case G2D_FMT_PYUV422UVC:
++		case G2D_FMT_PYUV420UVC:
++		case G2D_FMT_PYUV411UVC:
++				val = 0x6;
++			break;
++
++		case G2D_FMT_IYUV422:
++			if(pixel_seq == G2D_SEQ_YVYU)
++				val = 0x14;
++			else
++				val = 0x4;
++			break;
++		case G2D_FMT_RGB565:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x13;
++			else
++				val = 0x3;
++			break;
++		case G2D_FMT_BGR565:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x93;
++			else
++				val = 0x83;
++			break;
++		case G2D_FMT_ARGB1555:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x12;
++			else
++				val = 0x2;
++			break;
++		case G2D_FMT_ABGR1555:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x92;
++			else
++				val = 0x82;
++			break;
++		case G2D_FMT_RGBA5551:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0xb2;
++			else
++				val = 0xa2;
++			break;
++		case G2D_FMT_BGRA5551:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x32;
++			else
++				val = 0x22;
++			break;
++		case G2D_FMT_ARGB4444:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x11;
++			else
++				val = 0x01;
++			break;
++		case G2D_FMT_ABGR4444:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x91;
++			else
++				val = 0x81;
++			break;
++		case G2D_FMT_RGBA4444:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0xb1;
++			else
++				val = 0xa1;
++			break;
++		case G2D_FMT_BGRA4444:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x31;
++			else
++				val = 0x21;
++			break;
++		case G2D_FMT_ARGB_AYUV8888:
++		case G2D_FMT_XRGB8888:
++			val = 0x0;
++			break;
++		case G2D_FMT_BGRA_VUYA8888:
++		case G2D_FMT_BGRX8888:
++			val = 0x20;
++			break;
++		case G2D_FMT_ABGR_AVUY8888:
++		case G2D_FMT_XBGR8888:
++			val = 0x80;
++			break;
++		case G2D_FMT_RGBA_YUVA8888:
++		case G2D_FMT_RGBX8888:
++			val = 0xa0;
++			break;
++
++		default:
++			val = 0;break;
++	}
++	return val<<8;
++
++}
++
++__u32 mixer_in_csc_set(__u32 format)
++{
++	__u32 val = 0;
++	switch (format)
++	{
++		case G2D_FMT_IYUV422:
++			val = 0x11;
++			break;
++		case G2D_FMT_PYUV422UVC:
++			val = 0x21;
++			break;
++		case G2D_FMT_PYUV420UVC:
++			val = 0x31;
++			break;
++		case G2D_FMT_PYUV411UVC:
++			val = 0x41;
++			break;
++
++		default:
++			val = 0;break;
++	}
++
++	return val;
++}
++
++__u32 mixer_out_fmtseq_set(__u32 format,__u32 pixel_seq)
++{
++	__u32 val = 0;
++	switch (format)
++	{
++		case G2D_FMT_1BPP_MONO:
++			if	   (pixel_seq == G2D_SEQ_1BPP_LITTER_LITTER)
++				val = 0x38A;
++			else if(pixel_seq == G2D_SEQ_1BPP_BIG_LITTER)
++				val = 0x18A;
++			else if(pixel_seq == G2D_SEQ_1BPP_LITTER_BIG)
++				val = 0x28A;
++			else
++				val = 0x8A;
++			break;
++
++		case G2D_FMT_2BPP_MONO:
++			if	   (pixel_seq == G2D_SEQ_2BPP_LITTER_LITTER)
++				val = 0x389;
++			else if(pixel_seq == G2D_SEQ_2BPP_BIG_LITTER)
++				val = 0x189;
++			else if(pixel_seq == G2D_SEQ_2BPP_LITTER_BIG)
++				val = 0x289;
++			else
++				val = 0x89;
++			break;
++
++		case G2D_FMT_4BPP_MONO:
++			if	   (pixel_seq == G2D_SEQ_P01234567)
++				val = 0x388;
++			else if(pixel_seq == G2D_SEQ_P67452301)
++				val = 0x188;
++			else if(pixel_seq == G2D_SEQ_P10325476)
++				val = 0x288;
++			else
++				val = 0x88;
++			break;
++
++		case G2D_FMT_8BPP_MONO:
++			if(pixel_seq == G2D_SEQ_P0123)
++				val = 0x187;
++			else
++				val = 0x87;
++			break;
++		case G2D_FMT_PYUV422:
++			val = 0x86;
++			break;
++		case G2D_FMT_PYUV422UVC:
++			val = 0x85;
++			break;
++		case G2D_FMT_PYUV420UVC:
++			val = 0x8b;
++			break;
++		case G2D_FMT_PYUV420:
++			val = 0x8c;
++			break;
++		case G2D_FMT_PYUV411UVC:
++			val = 0x8d;
++			break;
++		case G2D_FMT_PYUV411:
++			val = 0x8e;
++			break;
++
++		case G2D_FMT_IYUV422:
++			if(pixel_seq == G2D_SEQ_YVYU)
++				val = 0x184;
++			else
++				val = 0x84;
++			break;
++		case G2D_FMT_RGB565:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x183;
++			else
++				val = 0x3;
++			break;
++		case G2D_FMT_BGR565:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x983;
++			else
++				val = 0x883;
++			break;
++		case G2D_FMT_ARGB1555:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x182;
++			else
++				val = 0x82;
++			break;
++		case G2D_FMT_ABGR1555:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x982;
++			else
++				val = 0x882;
++			break;
++		case G2D_FMT_RGBA5551:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0xb82;
++			else
++				val = 0xa82;
++			break;
++		case G2D_FMT_BGRA5551:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x382;
++			else
++				val = 0x282;
++			break;
++		case G2D_FMT_ARGB4444:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x181;
++			else
++				val = 0x81;
++			break;
++		case G2D_FMT_ABGR4444:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x981;
++			else
++				val = 0x881;
++			break;
++		case G2D_FMT_RGBA4444:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0xb81;
++			else
++				val = 0xa81;
++			break;
++		case G2D_FMT_BGRA4444:
++			if(pixel_seq == G2D_SEQ_P01)
++				val = 0x381;
++			else
++				val = 0x281;
++			break;
++		case G2D_FMT_ARGB_AYUV8888:
++		case G2D_FMT_XRGB8888:
++			val = 0x80;
++			break;
++		case G2D_FMT_BGRA_VUYA8888:
++		case G2D_FMT_BGRX8888:
++			val = 0x280;
++			break;
++		case G2D_FMT_ABGR_AVUY8888:
++		case G2D_FMT_XBGR8888:
++			val = 0x880;
++			break;
++		case G2D_FMT_RGBA_YUVA8888:
++		case G2D_FMT_RGBX8888:
++			val = 0xa80;
++			break;
++
++		default:
++			val = 80;break;
++	}
++	return val;
++
++}
++
++__u64 mixer_get_addr(__u32 buffer_addr, __u32 format, __u32 stride, __u32 x, __u32 y){
++	__u32	bpp = 0;
++	__u64	addr = 0;
++
++	bpp = mixer_bpp_count(format);
++	addr = (__u64)(buffer_addr-0x40000000)*8 + (__u64)((stride * y + x)*bpp);//bits
++
++	return addr;
++}
++
++__u32 mixer_get_irq(void){
++	__u32 reg_val = 0;
++
++	reg_val |= read_wvalue(G2D_STATUS_REG);
++
++	return reg_val;
++}
++
++__u32 mixer_clear_init(void){
++
++	write_wvalue(G2D_STATUS_REG, 0x300);
++	write_wvalue(G2D_CONTROL_REG, 0x0);
++
++	return 0;
++}
++
++__u32 mixer_set_rotate_reg(__u32 flag){
++	__u32 rot = 0;
++
++	if	   (flag & G2D_BLT_FLIP_HORIZONTAL	)rot = 0x10;
++	else if(flag & G2D_BLT_FLIP_VERTICAL	)rot = 0x20;
++	else if(flag & G2D_BLT_ROTATE90			)rot = 0x50;
++	else if(flag & G2D_BLT_ROTATE180		)rot = 0x30;
++	else if(flag & G2D_BLT_ROTATE270		)rot = 0x60;
++	else if(flag & G2D_BLT_MIRROR45			)rot = 0x70;
++	else if(flag & G2D_BLT_MIRROR135		)rot = 0x40;
++	else rot = 0;
++
++	return rot;
++}
++
++__s32 mixer_fillrectangle(g2d_fillrect *para){
++	__u32 reg_val = 0;
++	__u64 addr_val;
++	__s32 result = 0;
++
++	mixer_reg_init();/* initial mixer register */
++
++	/* channel0 is the fill surface */
++	write_wvalue(G2D_DMA0_SIZE_REG, (para->dst_rect.w -1) | ((para->dst_rect.h -1)<<16));
++
++	/* globe alpha mode */
++	if(para->flag & G2D_FIL_PLANE_ALPHA)
++	{
++		reg_val |= (para->alpha<<24)|0x4;
++	}
++	else if(para->flag & G2D_FIL_MULTI_ALPHA)
++	{
++		reg_val |= (para->alpha<<24)|0x8;
++	}
++	reg_val |= 0x1;
++	write_wvalue(G2D_DMA0_CONTROL_REG, reg_val);
++	mixer_set_fillcolor(para->color,0);
++	if((para->flag & G2D_FIL_PLANE_ALPHA) || (para->flag & G2D_FIL_PIXEL_ALPHA) || (para->flag & G2D_FIL_MULTI_ALPHA))
++	{
++		/* channel3 is the dst surface */
++		addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,para->dst_rect.x,para->dst_rect.y);
++		reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++		write_wvalue(G2D_DMA_HADDR_REG, reg_val<<24);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_DMA3_LADDR_REG, reg_val);
++		write_wvalue(G2D_DMA3_STRIDE_REG, para->dst_image.w*mixer_bpp_count(para->dst_image.format));
++		write_wvalue(G2D_DMA3_SIZE_REG, (para->dst_rect.w -1) | ((para->dst_rect.h -1)<<16));
++		reg_val = read_wvalue(G2D_DMA3_CONTROL_REG);
++
++		/* palette format */
++		if (para->dst_image.format>0x19)
++		{
++			reg_val |= 0x2;
++		}
++		reg_val |= G2D_IDMA_ENABLE | mixer_in_fmtseq_set(para->dst_image.format,para->dst_image.pixel_seq);
++		write_wvalue(G2D_DMA3_CONTROL_REG, reg_val);
++		write_wvalue(G2D_CK_CONTROL_REG, 0x1);
++	}
++	write_wvalue(G2D_ROP_INDEX0_REG, 0x840);
++
++	/* output surface is the dst surface */
++	write_wvalue(G2D_OUTPUT_SIZE_REG, (para->dst_rect.w -1) | ((para->dst_rect.h -1)<<16));
++
++	addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,para->dst_rect.x,para->dst_rect.y);
++	reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++	write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++	reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++	write_wvalue(G2D_OUTPUT0_LADDR_REG, reg_val);
++
++	write_wvalue(G2D_OUTPUT0_STRIDE_REG, para->dst_image.w*mixer_bpp_count(para->dst_image.format));
++	write_wvalue(G2D_OUTPUT_CONTROL_REG, mixer_out_fmtseq_set(para->dst_image.format,para->dst_image.pixel_seq));
++
++	/* start */
++	write_wvalue(G2D_CONTROL_REG, 0);
++	write_wvalue(G2D_CONTROL_REG, 0x303);
++	result = g2d_wait_cmd_finish();
++
++	return result;
++}
++
++/*
++ * Special fast path for just a simple copy/conversion between
++ * ARGB8888, XRGB8888 and RGB565 formats.
++ */
++static __s32 mixer_simple_blt(g2d_blt *para)
++{
++	__u32 reg_val;
++	__u64 addr_val;
++	__s32 result = 0;
++
++	/* Initial setup, clear all G2D hardware registers */
++	mixer_reg_init();
++
++	/*
++	 * In the case if source and destination buffers are overlapping, we
++	 * want to set a suitable scan order for getting correct results in
++	 * the use cases such as scrolling.
++	 *
++	 * Seems like trying to set horizontal scan order has no effect. But
++	 * at least setting vertical scan order allows to handle all types of
++	 * overlapped blits, except when both of the following conditions are
++	 * met at the same time:
++	 *   1) the destination buffer is shifted right relative to the source
++	 *      buffer by more than 1 pixel
++	 *   2) there is no vertical shift (src_y == dst_y)
++	 *
++	 * If the buffers are not overlapping, then the scan order does not
++	 * matter at all.
++	 */
++	if (para->src_image.addr[0] == para->dst_image.addr[0] &&
++					para->src_rect.y < para->dst_y) {
++		write_wvalue(G2D_SCAN_ORDER_REG, G2D_DOWN_TOP_LR);
++		/* dst_y has to point at the bottom scanline, not the top one */
++		para->dst_y += para->src_rect.h - 1;
++	}
++
++	/* Configure source surface */
++	addr_val = mixer_get_addr(para->src_image.addr[0],
++				  para->src_image.format, para->src_image.w,
++				  para->src_rect.x, para->src_rect.y);
++	reg_val = (addr_val >> 32) & 0xF; /* high addr in bits */
++	write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++	reg_val = addr_val & 0xFFFFFFFF; /* low addr in bits */
++	write_wvalue(G2D_DMA0_LADDR_REG, reg_val);
++	write_wvalue(G2D_DMA0_STRIDE_REG, para->src_image.w *
++				mixer_bpp_count(para->src_image.format));
++	write_wvalue(G2D_DMA0_SIZE_REG, (para->src_rect.w - 1) |
++					((para->src_rect.h - 1) << 16));
++	reg_val = read_wvalue(G2D_DMA0_CONTROL_REG) | G2D_IDMA_ENABLE;
++	reg_val |= mixer_in_fmtseq_set(para->src_image.format,
++				       para->src_image.pixel_seq);
++	/* Opaque source, need to set alpha channel to 0xFF */
++	if (para->src_image.format == G2D_FMT_XRGB8888)
++		reg_val |= (0xFF << 24) | 0x4;
++	write_wvalue(G2D_DMA0_CONTROL_REG, reg_val);
++
++	/*
++	 * Clear low bits before converting to RGB565 in order to avoid funny
++	 * rounding and data corruption for "RGB565 -> RGB565" copy operation.
++	 * The value in G2D_DMA1_FILLCOLOR_REG happens to be processed as a
++	 * constant for bitwise AND operation with the intermediate ARGB8888
++	 * format inside of the G2D pipeline in the default configuration.
++	 */
++	if (para->dst_image.format == G2D_FMT_RGB565)
++		write_wvalue(G2D_DMA1_FILLCOLOR_REG, 0xFFF8FCF8);
++	else
++		write_wvalue(G2D_DMA1_FILLCOLOR_REG, 0xFFFFFFFF);
++	write_wvalue(G2D_DMA2_FILLCOLOR_REG, 0xFFFFFFFF);
++
++	/* Configure output surface */
++	write_wvalue(G2D_OUTPUT_SIZE_REG, (para->src_rect.w - 1) |
++					  ((para->src_rect.h - 1) << 16));
++	addr_val = mixer_get_addr(para->dst_image.addr[0],
++				  para->dst_image.format, para->dst_image.w,
++				  para->dst_x, para->dst_y);
++	reg_val = (addr_val >> 32) & 0xF; /* high addr in bits */
++	write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++	reg_val = addr_val & 0xFFFFFFFF; /* low addr in bits */
++	write_wvalue(G2D_OUTPUT0_LADDR_REG, reg_val);
++	write_wvalue(G2D_OUTPUT0_STRIDE_REG, para->dst_image.w *
++				mixer_bpp_count(para->dst_image.format));
++	reg_val = mixer_out_fmtseq_set(para->dst_image.format,
++				       para->dst_image.pixel_seq);
++	write_wvalue(G2D_OUTPUT_CONTROL_REG, reg_val);
++
++	/* Start */
++	write_wvalue(G2D_CONTROL_REG, 0x0);
++	write_wvalue(G2D_CONTROL_REG, 0x303);
++	/* Wait for completion */
++	result = g2d_wait_cmd_finish();
++
++	return result;
++}
++
++__s32 mixer_blt(g2d_blt *para){
++	__u32 bppnum = 0;
++	__u32 reg_val = 0;
++	__u64 addr_val;
++	__s32 result = 0;
++	__u32 i,j;
++
++	/* Common formats are handled with a special fast path */
++	if (para->flag == G2D_BLT_NONE &&
++			(para->src_image.format == G2D_FMT_ARGB_AYUV8888 ||
++			 para->src_image.format == G2D_FMT_XRGB8888 ||
++			 para->src_image.format == G2D_FMT_RGB565) &&
++			(para->dst_image.format == G2D_FMT_ARGB_AYUV8888 ||
++			 para->dst_image.format == G2D_FMT_XRGB8888 ||
++			 para->dst_image.format == G2D_FMT_RGB565))
++		return mixer_simple_blt(para);
++
++	mixer_reg_init();/* initial mixer register */
++	if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A)&&(para->dst_image.pixel_seq == G2D_SEQ_VUVU)){
++		for(i=0, j=0; i<12; i++,j+=4)write_wvalue(G2D_CSC2_ADDR_REG + j, csc2coeff_VUVU[i]&0xFFFF);/* 0x1c0-0x1ec */
++	}
++
++	/* src surface */
++	addr_val = mixer_get_addr(para->src_image.addr[0],para->src_image.format,para->src_image.w,para->src_rect.x,para->src_rect.y);
++	reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++	write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++	reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++	write_wvalue(G2D_DMA0_LADDR_REG, reg_val);
++	write_wvalue(G2D_DMA0_STRIDE_REG, para->src_image.w*mixer_bpp_count(para->src_image.format));
++	write_wvalue(G2D_DMA0_SIZE_REG, (para->src_rect.w -1) | ((para->src_rect.h -1)<<16));
++	reg_val = read_wvalue(G2D_DMA0_CONTROL_REG);
++	reg_val |= mixer_in_fmtseq_set(para->src_image.format,para->src_image.pixel_seq) | G2D_IDMA_ENABLE;
++
++	/* rgbx/bgrx/xrgb/xbgr format */
++	if((para->src_image.format>0x03)&&(para->src_image.format<0x08))
++	{
++		reg_val |= (0xFF<<24)|0x4;
++	}
++
++	/* palette format */
++	if (para->src_image.format>0x1C)
++	{
++		reg_val |= 0x2;
++	}
++
++	/* globe alpha mode */
++	if(para->flag & G2D_BLT_PLANE_ALPHA)
++	{
++		reg_val |= (para->alpha<<24)|0x4;
++	}
++	else if(para->flag & G2D_BLT_MULTI_ALPHA)
++	{
++		reg_val |= (para->alpha<<24)|0x8;
++	}
++
++	/* rotate/mirror */
++	reg_val |= mixer_set_rotate_reg(para->flag);
++	write_wvalue(G2D_DMA0_CONTROL_REG, reg_val);
++	reg_val = mixer_in_csc_set(para->src_image.format);
++	write_wvalue(G2D_CSC0_CONTROL_REG, reg_val);
++	reg_val = mixer_in_csc_set(para->dst_image.format);
++	write_wvalue(G2D_CSC1_CONTROL_REG, reg_val);
++
++	/* pyuv422/420/411uvc */
++	if((para->src_image.format>0x16)&&(para->src_image.format<0x1A))
++	{
++		if(para->src_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++		else bppnum = 8;
++		if(para->src_image.format == G2D_FMT_PYUV420UVC)
++			addr_val = (__u64)(para->src_image.addr[1]-0x40000000)*8+(__u64)((para->src_image.w*(para->src_rect.y/2)+para->src_rect.x)*bppnum);
++		else addr_val = (__u64)(para->src_image.addr[1]-0x40000000)*8+(__u64)((para->src_image.w*para->src_rect.y+para->src_rect.x)*bppnum);
++		reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++		reg_val |= ((addr_val>>32)&0xF)<<8;/* high addr in bits */
++		write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_DMA1_LADDR_REG, reg_val);
++		write_wvalue(G2D_DMA1_STRIDE_REG, para->src_image.w*bppnum);
++		write_wvalue(G2D_DMA1_SIZE_REG, (para->src_rect.w -1) | ((para->src_rect.h -1)<<16));
++		reg_val = read_wvalue(G2D_DMA1_CONTROL_REG);
++		reg_val |= (5<<8) | G2D_IDMA_ENABLE;
++
++		/* rotate/mirror */
++		reg_val |= mixer_set_rotate_reg(para->flag);
++		write_wvalue(G2D_DMA1_CONTROL_REG, reg_val);
++	}
++
++	/* pyuv422/420/411uvc */
++	if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A))
++	{
++		if(para->dst_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++		else bppnum = 8;
++		if(para->dst_image.format == G2D_FMT_PYUV420UVC)
++			 addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*(para->dst_y/2)+para->dst_x)*bppnum);
++		else addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*para->dst_y+para->dst_x)*bppnum);
++		reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++		reg_val |= ((addr_val>>32)&0xF)<<16;/* high addr in bits */
++		write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_DMA2_LADDR_REG, reg_val);
++		write_wvalue(G2D_DMA2_STRIDE_REG, para->dst_image.w*bppnum);
++		write_wvalue(G2D_DMA2_SIZE_REG, (para->src_rect.w -1) | ((para->src_rect.h -1)<<16));
++		reg_val = read_wvalue(G2D_DMA2_CONTROL_REG);
++		reg_val |= (5<<8) | G2D_IDMA_ENABLE;
++		write_wvalue(G2D_DMA2_CONTROL_REG, reg_val);
++	}
++	write_wvalue(G2D_DMA1_FILLCOLOR_REG, 0xFFFFFFFF);
++	write_wvalue(G2D_DMA2_FILLCOLOR_REG, 0xFFFFFFFF);
++
++	/* channel3 is dst surface */
++	addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,para->dst_x,para->dst_y);
++	reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++	reg_val |= ((addr_val>>32)&0xF)<<24;/* high addr in bits */
++	write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++	reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++	write_wvalue(G2D_DMA3_LADDR_REG, reg_val);
++	write_wvalue(G2D_DMA3_STRIDE_REG, para->dst_image.w*mixer_bpp_count(para->dst_image.format));
++	if((para->flag & G2D_BLT_ROTATE90) || (para->flag & G2D_BLT_ROTATE270))
++		 write_wvalue(G2D_DMA3_SIZE_REG, (para->src_rect.h -1) | ((para->src_rect.w -1)<<16));
++	else write_wvalue(G2D_DMA3_SIZE_REG, (para->src_rect.w -1) | ((para->src_rect.h -1)<<16));
++	reg_val = read_wvalue(G2D_DMA3_CONTROL_REG);
++	reg_val |= mixer_in_fmtseq_set(para->dst_image.format,para->dst_image.pixel_seq) | G2D_IDMA_ENABLE;
++
++	/* rgbx/bgrx/xrgb/xbgr format */
++	if((para->dst_image.format>0x03)&&(para->dst_image.format<0x08))
++	{
++		reg_val |= (0xFF<<24)|0x4;
++	}
++	write_wvalue(G2D_DMA3_CONTROL_REG, reg_val);
++
++	/* colorkey */
++	if (para->flag & G2D_BLT_SRC_COLORKEY)
++	{
++		reg_val = 0x3;
++	}
++	else if(para->flag & G2D_BLT_DST_COLORKEY)
++	{
++		reg_val = 0x5;
++	}
++	else if((para->flag & G2D_BLT_PIXEL_ALPHA)||(para->flag & G2D_BLT_PLANE_ALPHA)||(para->flag & G2D_BLT_MULTI_ALPHA))
++	{
++		reg_val = 0x1;
++	}
++	else {reg_val = 0x0;}
++	write_wvalue(G2D_CK_CONTROL_REG, reg_val);
++	write_wvalue(G2D_CK_MINCOLOR_REG, para->color);
++	write_wvalue(G2D_CK_MAXCOLOR_REG, para->color);
++
++	/* output surface is the dst surface */
++	if((para->flag & G2D_BLT_ROTATE90) || (para->flag & G2D_BLT_ROTATE270))
++	{
++		write_wvalue(G2D_OUTPUT_SIZE_REG, (para->src_rect.h -1) | ((para->src_rect.w -1)<<16));
++	}
++	else
++	{
++		write_wvalue(G2D_OUTPUT_SIZE_REG, (para->src_rect.w -1) | ((para->src_rect.h -1)<<16));
++	}
++	addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,para->dst_x,para->dst_y);
++	reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++	write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++	reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++	write_wvalue(G2D_OUTPUT0_LADDR_REG, reg_val);
++	write_wvalue(G2D_OUTPUT0_STRIDE_REG, para->dst_image.w*mixer_bpp_count(para->dst_image.format));
++	reg_val = mixer_out_fmtseq_set(para->dst_image.format,para->dst_image.pixel_seq);
++	write_wvalue(G2D_OUTPUT_CONTROL_REG, reg_val);
++
++	if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A))
++	{
++		if(para->dst_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++		else bppnum = 8;
++		if(para->dst_image.format == G2D_FMT_PYUV420UVC)
++			 addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*(para->dst_y/2)+para->dst_x)*bppnum);
++		else addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*para->dst_y+para->dst_x)*bppnum);
++		reg_val = read_wvalue(G2D_OUTPUT_HADDR_REG);
++		reg_val |= ((addr_val>>32)&0xF)<<8;/* high addr in bits */
++		write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_OUTPUT1_LADDR_REG, reg_val);
++		write_wvalue(G2D_OUTPUT1_STRIDE_REG, para->dst_image.w*bppnum);
++		write_wvalue(G2D_CSC2_CONTROL_REG, 0x1);
++	}
++	if((para->dst_image.format>0x11)&&(para->dst_image.format<0x1D))write_wvalue(G2D_CSC2_CONTROL_REG, 0x1);
++	if((para->flag & G2D_BLT_PIXEL_ALPHA)|(para->flag & G2D_BLT_PLANE_ALPHA)|(para->flag & G2D_BLT_MULTI_ALPHA)|(para->flag & G2D_BLT_SRC_COLORKEY)|(para->flag & G2D_BLT_DST_COLORKEY))
++		write_wvalue(G2D_OALPHA_CONTROL_REG, 0x80);/* 0x40: A2 area keep the dst alpha,0x80: A2 area keep the src+dst(1-src) alpha value */
++
++	/* start */
++	write_wvalue(G2D_CONTROL_REG, 0x0);
++	write_wvalue(G2D_CONTROL_REG, 0x303);
++	result = g2d_wait_cmd_finish();
++
++	return result;
++}
++
++__s32 mixer_stretchblt(g2d_stretchblt *para){
++	__u32 bppnum = 0;
++	__u32 reg_val = 0;
++	__u32 reg_tmp = 0;
++	__u64 addr_val;
++	__u32 cnt,sinw,soutw,scaler_inx,scaler_outx,scaler_outy,i;
++	__s32 result = 0;
++
++	mixer_reg_init();/* initial mixer register */
++
++	/* src surface */
++	write_wvalue(G2D_DMA0_STRIDE_REG, para->src_image.w*mixer_bpp_count(para->src_image.format));
++	reg_val = read_wvalue(G2D_DMA0_CONTROL_REG);
++	reg_val |= mixer_in_fmtseq_set(para->src_image.format,para->src_image.pixel_seq) | G2D_IDMA_ENABLE;
++
++	/* rgbx/bgrx/xrgb/xbgr format */
++	if((para->src_image.format>0x03)&&(para->src_image.format<0x08))
++	{
++		reg_val |= (0xFF<<24)|0x4;
++	}
++
++	/* palette format */
++	if (para->src_image.format>0x1C)
++	{
++		reg_val |= 0x2;
++	}
++
++	/* globe alpha mode */
++	if(para->flag & G2D_BLT_PLANE_ALPHA)
++	{
++		reg_val |= (para->alpha<<24)|0x4;
++	}
++	else if(para->flag & G2D_BLT_MULTI_ALPHA)
++	{
++		reg_val |= (para->alpha<<24)|0x8;
++	}
++
++	/* rotate/mirror */
++	reg_val |= mixer_set_rotate_reg(para->flag);
++	write_wvalue(G2D_DMA0_CONTROL_REG, reg_val);
++	reg_val = mixer_in_csc_set(para->src_image.format);
++	write_wvalue(G2D_CSC0_CONTROL_REG, reg_val);
++	reg_val = mixer_in_csc_set(para->dst_image.format);
++	write_wvalue(G2D_CSC1_CONTROL_REG, reg_val);
++
++	/* sacler setting */
++	write_wvalue(G2D_SCALER_CONTROL_REG,G2D_SCALER_4TAP4 | G2D_SCALER_ENABLE);
++	write_wvalue(G2D_SCALER_HPHASE_REG,0);
++	write_wvalue(G2D_SCALER_VPHASE_REG,0);
++	write_wvalue(G2D_ROP_INDEX0_REG, 0x840);
++
++	/* channel3 is dst surface */
++	write_wvalue(G2D_DMA3_STRIDE_REG, para->dst_image.w*mixer_bpp_count(para->dst_image.format));
++	reg_val = read_wvalue(G2D_DMA3_CONTROL_REG);
++	reg_val |= mixer_in_fmtseq_set(para->dst_image.format,para->dst_image.pixel_seq) | G2D_IDMA_ENABLE;
++
++	/* rgbx/bgrx/xrgb/xbgr format */
++	if((para->src_image.format>0x03)&&(para->src_image.format<0x08))
++	{
++		reg_val |= (0xFF<<24)|0x4;
++	}
++	write_wvalue(G2D_DMA3_CONTROL_REG, reg_val);
++
++	/* colorkey */
++	if (para->flag & G2D_BLT_SRC_COLORKEY)
++	{
++		reg_val = 0x3;
++	}
++	else if(para->flag & G2D_BLT_DST_COLORKEY)
++	{
++		reg_val = 0x5;
++	}
++	else if((para->flag & G2D_BLT_PIXEL_ALPHA)||(para->flag & G2D_BLT_PLANE_ALPHA)||(para->flag & G2D_BLT_MULTI_ALPHA))
++	{
++		reg_val = 1;
++	}
++	else {reg_val = 0x0;}
++	write_wvalue(G2D_CK_CONTROL_REG, reg_val);
++	write_wvalue(G2D_CK_MINCOLOR_REG, para->color);
++	write_wvalue(G2D_CK_MAXCOLOR_REG, para->color);
++
++	write_wvalue(G2D_OUTPUT0_STRIDE_REG, para->dst_image.w*mixer_bpp_count(para->dst_image.format));
++	reg_val = mixer_out_fmtseq_set(para->dst_image.format,para->dst_image.pixel_seq);
++	write_wvalue(G2D_OUTPUT_CONTROL_REG, reg_val);
++	if((para->flag & G2D_BLT_PIXEL_ALPHA)|(para->flag & G2D_BLT_PLANE_ALPHA)|(para->flag & G2D_BLT_MULTI_ALPHA)|(para->flag & G2D_BLT_SRC_COLORKEY)|(para->flag & G2D_BLT_DST_COLORKEY))
++		write_wvalue(G2D_OALPHA_CONTROL_REG, 0x80);/* 0x40: A2 area keep the dst alpha,0x80: A2 area keep the src+dst(1-src) alpha value */
++
++	/* output width lager than 1024 pixel width */
++	if(para->dst_rect.w>0x400)
++	{
++		/* scaler up divide the output into 1024 pixel width part */
++		cnt = para->dst_rect.w/1024;
++		cnt = (para->dst_rect.w%1024)?cnt:cnt-1;
++		sinw = (para->src_rect.w/para->dst_rect.w)<<10;
++		sinw |= ((para->src_rect.w%para->dst_rect.w)<<10)/para->dst_rect.w;
++		scaler_inx = para->src_rect.x;
++		scaler_outx = para->dst_rect.x;
++		if((para->flag & G2D_BLT_ROTATE90))
++			 scaler_outy = para->dst_rect.y + para->dst_rect.w - 0x401;
++		else scaler_outy = para->dst_rect.y;
++		for(i = 0; i<cnt; i++)
++		{
++			/* DMA0 */
++			addr_val = mixer_get_addr(para->src_image.addr[0],para->src_image.format,para->src_image.w,scaler_inx,para->src_rect.y);
++			reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++			write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_DMA0_LADDR_REG, reg_val);
++			if(sinw<1)sinw = 1;
++			write_wvalue(G2D_DMA0_SIZE_REG, (sinw -1) | ((para->src_rect.h -1)<<16));
++
++			/* DMA1 pyuv422/420/411uvc */
++			if((para->src_image.format>0x16)&&(para->src_image.format<0x1A))
++			{
++				if(para->src_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++				else bppnum = 8;
++				if(para->src_image.format == G2D_FMT_PYUV420UVC)
++					 addr_val = (__u64)(para->src_image.addr[1]-0x40000000)*8+(__u64)((para->src_image.w*(para->src_rect.y/2)+scaler_inx)*bppnum);
++				else addr_val = (__u64)(para->src_image.addr[1]-0x40000000)*8+(__u64)((para->src_image.w*para->src_rect.y+scaler_inx)*bppnum);
++				reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++				reg_val |= ((addr_val>>32)&0xF)<<8;/* high addr in bits */
++				write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++				reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++				write_wvalue(G2D_DMA1_LADDR_REG, reg_val);
++				write_wvalue(G2D_DMA1_STRIDE_REG, para->src_image.w*bppnum);
++				if(sinw<1)sinw = 1;
++				write_wvalue(G2D_DMA1_SIZE_REG, (sinw -1) | ((para->src_rect.h -1)<<16));
++				reg_val = read_wvalue(G2D_DMA1_CONTROL_REG);
++				reg_val |= (5<<8) | G2D_IDMA_ENABLE;
++
++				/* rotate/mirror */
++				reg_val |= mixer_set_rotate_reg(para->flag);
++				write_wvalue(G2D_DMA1_CONTROL_REG, reg_val);
++			}
++
++			/* scaler setting */
++			write_wvalue(G2D_SCALER_SIZE_REG,(0x400 - 1) | ((para->dst_rect.h - 1)<<16));
++			reg_val = (sinw/0x400)<<16;
++			reg_tmp = (sinw%0x400);
++			reg_val |= (reg_tmp<<16)/0x400;
++			write_wvalue(G2D_SCALER_HFACTOR_REG,reg_val);
++
++			reg_val = (para->src_rect.h/para->dst_rect.h)<<16;
++			reg_tmp = (para->src_rect.h%para->dst_rect.h);
++			reg_val |= (reg_tmp<<16)/para->dst_rect.h;
++			write_wvalue(G2D_SCALER_VFACTOR_REG,reg_val);
++
++			/* DMA2 pyuv422/420/411uvc */
++			if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A))
++			{
++				if(para->dst_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++				else bppnum = 8;
++				if(para->dst_image.format == G2D_FMT_PYUV420UVC)
++					 addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*(para->dst_rect.y/2) + scaler_outx)*bppnum);
++				else addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*para->dst_rect.y + scaler_outx)*bppnum);
++				reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++				reg_val |= ((addr_val>>32)&0xF)<<16;/* high addr in bits */
++				write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++				reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++				write_wvalue(G2D_DMA2_LADDR_REG, reg_val);
++				write_wvalue(G2D_DMA2_STRIDE_REG, para->dst_image.w*bppnum);
++				write_wvalue(G2D_DMA2_SIZE_REG, (0x400 -1) | ((para->dst_rect.h -1)<<16));
++				reg_val = read_wvalue(G2D_DMA2_CONTROL_REG);
++				reg_val |= (5<<8) | G2D_IDMA_ENABLE;
++				write_wvalue(G2D_DMA2_CONTROL_REG, reg_val);
++			}
++
++			/* DMA3 */
++			addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,scaler_outx,para->dst_rect.y);
++			reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++			reg_val = reg_val&0xF0FFFFFF;
++			reg_val |= ((addr_val>>32)&0xF)<<24;/* high addr in bits */
++			write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_DMA3_LADDR_REG, reg_val);
++			write_wvalue(G2D_DMA3_SIZE_REG, (0x400 -1) | ((para->dst_rect.h -1)<<16));
++
++			/* OUT */
++			if((para->flag & G2D_BLT_ROTATE90) || (para->flag & G2D_BLT_ROTATE270))
++				 write_wvalue(G2D_OUTPUT_SIZE_REG, (para->dst_rect.h -1) | ((0x400 -1)<<16));
++			else write_wvalue(G2D_OUTPUT_SIZE_REG, (0x400 -1) | ((para->dst_rect.h -1)<<16));
++			addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,scaler_outx,scaler_outy);
++			reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++			write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_OUTPUT0_LADDR_REG, reg_val);
++
++			/* OUT1 */
++			if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A))
++			{
++				if(para->dst_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++				else bppnum = 8;
++				if(para->dst_image.format == G2D_FMT_PYUV420UVC)
++					 addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*(scaler_outy/2) + scaler_outx)*bppnum);
++				else addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*scaler_outy + scaler_outx)*bppnum);
++				reg_val = read_wvalue(G2D_OUTPUT_HADDR_REG);
++				reg_val |= ((addr_val>>32)&0xF)<<8;/* high addr in bits */
++				write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++				reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++				write_wvalue(G2D_OUTPUT1_LADDR_REG, reg_val);
++				write_wvalue(G2D_OUTPUT1_STRIDE_REG, para->dst_image.w*bppnum);
++				write_wvalue(G2D_CSC2_CONTROL_REG, 0x1);
++			}
++			if((para->dst_image.format>0x11)&&(para->dst_image.format<0x1D))write_wvalue(G2D_CSC2_CONTROL_REG, 0x1);
++
++			scaler_inx +=sinw;
++			if((para->flag & G2D_BLT_ROTATE90))
++			{
++				scaler_outy -=0x400;
++				scaler_outx = para->dst_rect.x;
++			}
++			else if((para->flag & G2D_BLT_ROTATE270))
++			{
++				scaler_outy +=0x400;
++				scaler_outx = para->dst_rect.x;
++			}
++			else
++			{
++				scaler_outy = para->dst_rect.y;
++				scaler_outx +=0x400;
++			}
++
++			/* start */
++			write_wvalue(G2D_CONTROL_REG, 0x0);
++			write_wvalue(G2D_CONTROL_REG, 0x303);
++			result |= g2d_wait_cmd_finish();
++			if(result!=0)return result;
++		}
++
++		/* last block */
++		soutw = para->dst_rect.w - 0x400*cnt;
++		sinw = para->src_rect.w - sinw*cnt;
++
++		/* DMA0 */
++		addr_val = mixer_get_addr(para->src_image.addr[0],para->src_image.format,para->src_image.w,scaler_inx,para->src_rect.y);
++		reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++		write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_DMA0_LADDR_REG, reg_val);
++		write_wvalue(G2D_DMA0_SIZE_REG, (sinw -1) | ((para->src_rect.h -1)<<16));
++
++		/* DMA1 pyuv422/420/411uvc */
++		if((para->src_image.format>0x16)&&(para->src_image.format<0x1A))
++		{
++			if(para->src_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++			else bppnum = 8;
++			if(para->src_image.format == G2D_FMT_PYUV420UVC)
++				 addr_val = (__u64)(para->src_image.addr[1]-0x40000000)*8+(__u64)((para->src_image.w*(para->src_rect.y/2)+scaler_inx)*bppnum);
++			else addr_val = (__u64)(para->src_image.addr[1]-0x40000000)*8+(__u64)((para->src_image.w*para->src_rect.y+scaler_inx)*bppnum);
++			reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++			reg_val |= ((addr_val>>32)&0xF)<<8;/* high addr in bits */
++			write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_DMA1_LADDR_REG, reg_val);
++			write_wvalue(G2D_DMA1_STRIDE_REG, para->src_image.w*bppnum);
++			if(sinw<1)sinw = 1;
++			write_wvalue(G2D_DMA1_SIZE_REG, (sinw -1) | ((para->src_rect.h -1)<<16));
++			reg_val = read_wvalue(G2D_DMA1_CONTROL_REG);
++			reg_val |= (5<<8) | G2D_IDMA_ENABLE;
++
++			/* rotate/mirror */
++			reg_val |= mixer_set_rotate_reg(para->flag);
++			write_wvalue(G2D_DMA1_CONTROL_REG, reg_val);
++		}
++
++		/* scaler setting */
++		if(soutw<1)soutw = 1;
++		write_wvalue(G2D_SCALER_SIZE_REG,(soutw- 1) | ((para->dst_rect.h - 1)<<16));
++		reg_val = (sinw/soutw)<<16;
++		reg_tmp = (sinw%soutw);
++		reg_val |= (reg_tmp<<16)/soutw;
++		write_wvalue(G2D_SCALER_HFACTOR_REG,reg_val);
++
++		reg_val = (para->src_rect.h/para->dst_rect.h)<<16;
++		reg_tmp = (para->src_rect.h%para->dst_rect.h);
++		reg_val |= (reg_tmp<<16)/para->dst_rect.h;
++		write_wvalue(G2D_SCALER_VFACTOR_REG,reg_val);
++
++		/* DMA2 pyuv422/420/411uvc */
++		if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A))
++		{
++			if(para->dst_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++			else bppnum = 8;
++			if(para->dst_image.format == G2D_FMT_PYUV420UVC)
++				 addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*(para->dst_rect.y/2) + scaler_outx)*bppnum);
++			else addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*para->dst_rect.y + scaler_outx)*bppnum);
++			reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++			reg_val |= ((addr_val>>32)&0xF)<<16;/* high addr in bits */
++			write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_DMA2_LADDR_REG, reg_val);
++			write_wvalue(G2D_DMA2_STRIDE_REG, para->dst_image.w*bppnum);
++			if(soutw<1)soutw = 1;
++			write_wvalue(G2D_DMA2_SIZE_REG, (soutw -1) | ((para->dst_rect.h -1)<<16));
++			reg_val = read_wvalue(G2D_DMA2_CONTROL_REG);
++			reg_val |= (5<<8) | G2D_IDMA_ENABLE;
++			write_wvalue(G2D_DMA2_CONTROL_REG, reg_val);
++		}
++
++		/* DMA3 */
++		addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,scaler_outx,para->dst_rect.y);
++		reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++		reg_val = reg_val&0xF0FFFFFF;
++		reg_val |= ((addr_val>>32)&0xF)<<24;/* high addr in bits */
++		write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_DMA3_LADDR_REG, reg_val);
++		write_wvalue(G2D_DMA3_SIZE_REG, (soutw - 1) | ((para->dst_rect.h -1)<<16));
++
++		/* OUT */
++		if((para->flag & G2D_BLT_ROTATE90) || (para->flag & G2D_BLT_ROTATE270))
++			 write_wvalue(G2D_OUTPUT_SIZE_REG, (para->dst_rect.h -1) | ((soutw - 1)<<16));
++		else write_wvalue(G2D_OUTPUT_SIZE_REG, (soutw - 1) | ((para->dst_rect.h -1)<<16));
++		if((para->flag & G2D_BLT_ROTATE270))
++			 addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,scaler_outx,scaler_outy);
++		else addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,scaler_outx,para->dst_rect.y);
++		reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++		write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_OUTPUT0_LADDR_REG, reg_val);
++
++		/* OUT1 */
++		if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A))
++		{
++			if(para->dst_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++			else bppnum = 8;
++			if(para->dst_image.format == G2D_FMT_PYUV420UVC)
++				 addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*(para->dst_rect.y/2) + scaler_outx)*bppnum);
++			else addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*para->dst_rect.y + scaler_outx)*bppnum);
++			reg_val = read_wvalue(G2D_OUTPUT_HADDR_REG);
++			reg_val |= ((addr_val>>32)&0xF)<<8;/* high addr in bits */
++			write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_OUTPUT1_LADDR_REG, reg_val);
++			write_wvalue(G2D_OUTPUT1_STRIDE_REG, para->dst_image.w*bppnum);
++			write_wvalue(G2D_CSC2_CONTROL_REG, 0x1);
++		}
++		if((para->dst_image.format>0x11)&&(para->dst_image.format<0x1D))write_wvalue(G2D_CSC2_CONTROL_REG, 0x1);
++
++		/* start */
++		write_wvalue(G2D_CONTROL_REG, 0x0);
++		write_wvalue(G2D_CONTROL_REG, 0x303);
++		result |= g2d_wait_cmd_finish();
++	}
++
++	/* output width smaller than 1024 pixel width */
++	else
++	{
++		addr_val = mixer_get_addr(para->src_image.addr[0],para->src_image.format,para->src_image.w,para->src_rect.x,para->src_rect.y);
++		reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++		write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_DMA0_LADDR_REG, reg_val);
++		write_wvalue(G2D_DMA0_SIZE_REG, (para->src_rect.w -1) | ((para->src_rect.h -1)<<16));
++
++		write_wvalue(G2D_SCALER_SIZE_REG,(para->dst_rect.w - 1) | ((para->dst_rect.h -1)<<16));
++		reg_val = (para->src_rect.w/para->dst_rect.w)<<16;
++		reg_tmp = (para->src_rect.w%para->dst_rect.w);
++		reg_val |= (reg_tmp<<16)/para->dst_rect.w;
++		write_wvalue(G2D_SCALER_HFACTOR_REG,reg_val);
++		reg_val = (para->src_rect.h/para->dst_rect.h)<<16;
++		reg_tmp = (para->src_rect.h%para->dst_rect.h);
++		reg_val |= (reg_tmp<<16)/para->dst_rect.h;
++		write_wvalue(G2D_SCALER_VFACTOR_REG,reg_val);
++
++		/* pyuv422/420/411uvc */
++		if((para->src_image.format>0x16)&&(para->src_image.format<0x1A))
++		{
++			if(para->src_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++			else bppnum = 8;
++			if(para->src_image.format == G2D_FMT_PYUV420UVC)
++				 addr_val = (__u64)(para->src_image.addr[1]-0x40000000)*8+(__u64)((para->src_image.w*(para->src_rect.y/2)+para->src_rect.x)*bppnum);
++			else addr_val = (__u64)(para->src_image.addr[1]-0x40000000)*8+(__u64)((para->src_image.w*para->src_rect.y+para->src_rect.x)*bppnum);
++			reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++			reg_val |= ((addr_val>>32)&0xF)<<8;/* high addr in bits */
++			write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_DMA1_LADDR_REG, reg_val);
++			write_wvalue(G2D_DMA1_STRIDE_REG, para->src_image.w*bppnum);
++			write_wvalue(G2D_DMA1_SIZE_REG, (para->src_rect.w -1) | ((para->src_rect.h -1)<<16));
++			reg_val = read_wvalue(G2D_DMA1_CONTROL_REG);
++			reg_val |= (5<<8) | G2D_IDMA_ENABLE;
++			write_wvalue(G2D_DMA1_CONTROL_REG, reg_val);
++		}
++
++		/* pyuv422/420/411uvc */
++		if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A))
++		{
++			if(para->dst_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++			else bppnum = 8;
++			if(para->dst_image.format == G2D_FMT_PYUV420UVC)
++				 addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*(para->dst_rect.y/2)+para->dst_rect.x)*bppnum);
++			else addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*para->dst_rect.y+para->dst_rect.x)*bppnum);
++			reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++			reg_val |= ((addr_val>>32)&0xF)<<16;/* high addr in bits */
++			write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_DMA2_LADDR_REG, reg_val);
++			write_wvalue(G2D_DMA2_STRIDE_REG, para->dst_image.w*bppnum);
++			write_wvalue(G2D_DMA2_SIZE_REG, (para->dst_rect.w -1) | ((para->dst_rect.h -1)<<16));
++			reg_val = read_wvalue(G2D_DMA2_CONTROL_REG);
++			reg_val |= (5<<8) | G2D_IDMA_ENABLE;
++			write_wvalue(G2D_DMA2_CONTROL_REG, reg_val);
++		}
++
++		addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,para->dst_rect.x,para->dst_rect.y);
++		reg_val = read_wvalue(G2D_DMA_HADDR_REG);
++		reg_val |= ((addr_val>>32)&0xF)<<24;/* high addr in bits */
++		write_wvalue(G2D_DMA_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_DMA3_LADDR_REG, reg_val);
++		write_wvalue(G2D_DMA3_SIZE_REG, (para->dst_rect.w -1) | ((para->dst_rect.h -1)<<16));
++
++		/* output surface is the dst surface */
++		if((para->flag & G2D_BLT_ROTATE90) || (para->flag & G2D_BLT_ROTATE270))
++			 write_wvalue(G2D_OUTPUT_SIZE_REG, (para->dst_rect.h -1) | ((para->dst_rect.w -1)<<16));
++		else write_wvalue(G2D_OUTPUT_SIZE_REG, (para->dst_rect.w -1) | ((para->dst_rect.h -1)<<16));
++		addr_val = mixer_get_addr(para->dst_image.addr[0],para->dst_image.format,para->dst_image.w,para->dst_rect.x,para->dst_rect.y);
++		reg_val = (addr_val>>32)&0xF;/* high addr in bits */
++		write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++		reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++		write_wvalue(G2D_OUTPUT0_LADDR_REG, reg_val);
++
++		if((para->dst_image.format>0x16)&&(para->dst_image.format<0x1A))
++		{
++			if(para->dst_image.format == G2D_FMT_PYUV411UVC) bppnum = 4;
++			else bppnum = 8;
++			if(para->dst_image.format == G2D_FMT_PYUV420UVC)
++				 addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*(para->dst_rect.y/2)+para->dst_rect.x)*bppnum);
++			else addr_val = (__u64)(para->dst_image.addr[1]-0x40000000)*8+(__u64)((para->dst_image.w*para->dst_rect.y+para->dst_rect.x)*bppnum);
++			reg_val = read_wvalue(G2D_OUTPUT_HADDR_REG);
++			reg_val |= ((addr_val>>32)&0xF)<<8;/* high addr in bits */
++			write_wvalue(G2D_OUTPUT_HADDR_REG, reg_val);
++			reg_val = addr_val&0xFFFFFFFF;/* low addr in bits */
++			write_wvalue(G2D_OUTPUT1_LADDR_REG, reg_val);
++			write_wvalue(G2D_OUTPUT1_STRIDE_REG, para->dst_image.w*bppnum);
++			write_wvalue(G2D_CSC2_CONTROL_REG, 0x1);
++		}
++		if((para->dst_image.format>0x11)&&(para->dst_image.format<0x1D))write_wvalue(G2D_CSC2_CONTROL_REG, 0x1);
++
++		/* start */
++		write_wvalue(G2D_CONTROL_REG, 0x0);
++		write_wvalue(G2D_CONTROL_REG, 0x303);
++		result = g2d_wait_cmd_finish();
++	}
++
++	return result;
++}
++
++__u32 mixer_set_palette(g2d_palette *para){
++	__u32 *pdest_end;
++    __u32 *psrc_cur;
++    __u32 *pdest_cur;
++
++    if(para->size > 0x400)
++    {
++    	para->size = 0x400;
++    }
++
++	psrc_cur = para->pbuffer;
++	pdest_cur = (__u32*)(base_addr+G2D_PALETTE_TAB_REG);
++	pdest_end = pdest_cur + (para->size>>2);
++
++    while(pdest_cur < pdest_end)
++    {
++		*(volatile __u32 *)pdest_cur++ = *psrc_cur++;
++    }
++
++   return 0;
++}
+diff --git a/drivers/char/sun4i_g2d/g2d_bsp.h b/drivers/char/sun4i_g2d/g2d_bsp.h
+new file mode 100644
+index 0000000..c59c078
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/g2d_bsp.h
+@@ -0,0 +1,265 @@
++/* g2d_bsp.h
++ *
++ * Copyright (c)	2011 xxxx Electronics
++ *					2011 Yupu Tang
++ *
++ * @F23 G2D driver
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307USA
++ */
++
++#ifndef __G2D_BSP_H
++#define __G2D_BSP_H
++
++#include "linux/kernel.h"
++#include "linux/mm.h"
++#include <asm/uaccess.h>
++#include <asm/memory.h>
++#include <asm/unistd.h>
++#include "linux/semaphore.h"
++#include <linux/vmalloc.h>
++#include <linux/fs.h>
++#include <linux/dma-mapping.h>
++#include <linux/fb.h>
++#include <linux/sched.h>
++#include <linux/kthread.h>
++#include <linux/err.h>
++#include <linux/delay.h>
++#include <linux/platform_device.h>
++#include "asm-generic/int-ll64.h"
++
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/platform_device.h>
++#include <linux/clk.h>
++#include <linux/cdev.h>
++#include <linux/types.h>
++
++#ifndef __G2D_BSP_DRV_H
++#define __G2D_BSP_DRV_H
++
++/* mixer data format */
++typedef enum {
++	/* share data format */
++	G2D_FMT_ARGB_AYUV8888	= (0x0),
++	G2D_FMT_BGRA_VUYA8888	= (0x1),
++	G2D_FMT_ABGR_AVUY8888	= (0x2),
++	G2D_FMT_RGBA_YUVA8888	= (0x3),
++
++	G2D_FMT_XRGB8888		= (0x4),
++	G2D_FMT_BGRX8888		= (0x5),
++	G2D_FMT_XBGR8888		= (0x6),
++	G2D_FMT_RGBX8888		= (0x7),
++
++	G2D_FMT_ARGB4444		= (0x8),
++	G2D_FMT_ABGR4444		= (0x9),
++	G2D_FMT_RGBA4444		= (0xA),
++	G2D_FMT_BGRA4444		= (0xB),
++
++	G2D_FMT_ARGB1555		= (0xC),
++	G2D_FMT_ABGR1555		= (0xD),
++	G2D_FMT_RGBA5551		= (0xE),
++	G2D_FMT_BGRA5551		= (0xF),
++
++	G2D_FMT_RGB565			= (0x10),
++	G2D_FMT_BGR565			= (0x11),
++
++	G2D_FMT_IYUV422			= (0x12),
++
++	G2D_FMT_8BPP_MONO		= (0x13),
++	G2D_FMT_4BPP_MONO		= (0x14),
++	G2D_FMT_2BPP_MONO		= (0x15),
++	G2D_FMT_1BPP_MONO		= (0x16),
++
++	G2D_FMT_PYUV422UVC		= (0x17),
++	G2D_FMT_PYUV420UVC		= (0x18),
++	G2D_FMT_PYUV411UVC		= (0x19),
++
++	/* just for output format */
++	G2D_FMT_PYUV422			= (0x1A),
++	G2D_FMT_PYUV420			= (0x1B),
++	G2D_FMT_PYUV411			= (0x1C),
++
++	/* just for input format */
++	G2D_FMT_8BPP_PALETTE	= (0x1D),
++	G2D_FMT_4BPP_PALETTE	= (0x1E),
++	G2D_FMT_2BPP_PALETTE	= (0x1F),
++	G2D_FMT_1BPP_PALETTE	= (0x20),
++
++}g2d_data_fmt;
++
++typedef enum {
++	G2D_SEQ_NORMAL = 0x0,
++
++	/* for interleaved yuv422 */
++    G2D_SEQ_VYUY   = 0x1,				/* pixel 0å¨ä½16ä½ */
++    G2D_SEQ_YVYU   = 0x2,				/* pixel 1å¨ä½16ä½ */
++
++	/* for uv_combined yuv420 */
++    G2D_SEQ_VUVU   = 0x3,
++
++	/* for 16bpp rgb */
++    G2D_SEQ_P10    = 0x4,				/* pixel 0å¨ä½16ä½ */
++    G2D_SEQ_P01    = 0x5,				/* pixel 1å¨ä½16ä½ */
++
++	/* planar format or 8bpp rgb */
++    G2D_SEQ_P3210  = 0x6,				/* pixel 0å¨ä½8ä½ */
++    G2D_SEQ_P0123  = 0x7,				/* pixel 3å¨ä½8ä½ */
++
++	/* for 4bpp rgb */
++    G2D_SEQ_P76543210  = 0x8,			/* 7,6,5,4,3,2,1,0 */
++    G2D_SEQ_P67452301  = 0x9,			/* 6,7,4,5,2,3,0,1 */
++    G2D_SEQ_P10325476  = 0xA,			/* 1,0,3,2,5,4,7,6 */
++    G2D_SEQ_P01234567  = 0xB,			/* 0,1,2,3,4,5,6,7 */
++
++	/* for 2bpp rgb */
++    G2D_SEQ_2BPP_BIG_BIG       = 0xC,	/* 15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0 */
++    G2D_SEQ_2BPP_BIG_LITTER    = 0xD,	/* 12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3 */
++    G2D_SEQ_2BPP_LITTER_BIG    = 0xE,	/* 3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12 */
++    G2D_SEQ_2BPP_LITTER_LITTER = 0xF,	/* 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 */
++
++	/* for 1bpp rgb */
++    G2D_SEQ_1BPP_BIG_BIG       = 0x10,	/* 31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0 */
++    G2D_SEQ_1BPP_BIG_LITTER    = 0x11,	/* 24,25,26,27,28,29,30,31,16,17,18,19,20,21,22,23,8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7 */
++    G2D_SEQ_1BPP_LITTER_BIG    = 0x12,	/* 7,6,5,4,3,2,1,0,15,14,13,12,11,10,9,8,23,22,21,20,19,18,17,16,31,30,29,28,27,26,25,24 */
++    G2D_SEQ_1BPP_LITTER_LITTER = 0x13,	/* 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31 */
++}g2d_pixel_seq;
++
++
++typedef enum {
++	G2D_FIL_NONE			= 0x00000000,
++	G2D_FIL_PIXEL_ALPHA		= 0x00000001,
++	G2D_FIL_PLANE_ALPHA		= 0x00000002,
++	G2D_FIL_MULTI_ALPHA		= 0x00000004,
++}g2d_fillrect_flags;
++
++typedef enum {
++
++	G2D_BLT_NONE			= 0x00000000,
++	G2D_BLT_PIXEL_ALPHA		= 0x00000001,
++	G2D_BLT_PLANE_ALPHA		= 0x00000002,
++	G2D_BLT_MULTI_ALPHA		= 0x00000004,
++	G2D_BLT_SRC_COLORKEY	= 0x00000008,
++	G2D_BLT_DST_COLORKEY	= 0x00000010,
++	G2D_BLT_FLIP_HORIZONTAL	= 0x00000020,
++	G2D_BLT_FLIP_VERTICAL	= 0x00000040,
++	G2D_BLT_ROTATE90		= 0x00000080,
++	G2D_BLT_ROTATE180		= 0x00000100,
++	G2D_BLT_ROTATE270		= 0x00000200,
++	G2D_BLT_MIRROR45		= 0x00000400,
++	G2D_BLT_MIRROR135		= 0x00000800,
++}g2d_blt_flags;
++
++/* flip rectangle struct */
++typedef struct {
++	__s32		x;			/* left top point coordinate x */
++	__s32		y;			/* left top point coordinate y */
++	__u32		w;			/* rectangle width */
++	__u32		h;			/* rectangle height */
++}g2d_rect;
++
++/* image struct */
++typedef struct {
++	__u32			 addr[3];	/* base addr of image frame buffer in byte */
++	__u32			 w;			/* width of image frame buffer in pixel */
++	__u32			 h;			/* height of image frame buffer in pixel */
++	g2d_data_fmt	 format;	/* pixel format of image frame buffer */
++	g2d_pixel_seq	 pixel_seq;	/* pixel sequence of image frame buffer */
++}g2d_image;
++
++typedef struct {
++	g2d_fillrect_flags	 flag;
++	g2d_image			 dst_image;
++	g2d_rect			 dst_rect;
++
++	__u32				 color;		/* fill color */
++	__u32				 alpha;		/* plane alpha value */
++
++}g2d_fillrect;
++
++typedef struct {
++	g2d_blt_flags		 flag;
++	g2d_image			 src_image;
++	g2d_rect			 src_rect;
++
++	g2d_image			 dst_image;
++	__s32				 dst_x;		/* left top point coordinate x of dst rect */
++	__s32				 dst_y;		/* left top point coordinate y of dst rect */
++
++	__u32				 color;		/* colorkey color */
++	__u32				 alpha;		/* plane alpha value */
++
++}g2d_blt;
++
++typedef struct {
++	g2d_blt_flags		 flag;
++	g2d_image			 src_image;
++	g2d_rect			 src_rect;
++
++	g2d_image			 dst_image;
++	g2d_rect			 dst_rect;
++
++	__u32				 color;		/* colorkey color */
++	__u32				 alpha;		/* plane alpha value */
++
++}g2d_stretchblt;
++
++typedef struct {
++	__u32		 flag;		/* åæ æä½ç  */
++	g2d_image	 dst_image;
++	g2d_rect	 dst_rect;
++
++	g2d_image	 src_image;
++	__u32		 src_x;
++	__u32		 src_y;
++
++	g2d_image	 mask_image;
++	__u32		 mask_x;
++	__u32		 mask_y;
++
++}g2d_maskblt;
++
++typedef struct {
++	__u32		*pbuffer;
++	__u32		 size;
++
++}g2d_palette;
++
++#endif	/* __G2D_BSP_DRV_H */
++
++typedef struct {
++	__u32	g2d_base;
++	int	(*g2d_begin)(void);
++	int	(*g2d_finish)(void);
++}g2d_init_para;
++
++__u32	mixer_reg_init(void);
++__s32	mixer_blt(g2d_blt *para);
++__s32	mixer_fillrectangle(g2d_fillrect *para);
++__s32	mixer_stretchblt(g2d_stretchblt *para);
++__s32	mixer_maskblt(g2d_maskblt *para);
++__u32	mixer_set_palette(g2d_palette *para);
++__u64	mixer_get_addr(__u32 buffer_addr, __u32 format, __u32 stride, __u32 x, __u32 y);
++__u32	mixer_set_reg_base(__u32 addr);
++__u32	mixer_get_irq(void);
++__u32	mixer_clear_init(void);
++
++
++#endif	/* __G2D_BSP_H */
++
+diff --git a/drivers/char/sun4i_g2d/g2d_driver.c b/drivers/char/sun4i_g2d/g2d_driver.c
+new file mode 100644
+index 0000000..c530029
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/g2d_driver.c
+@@ -0,0 +1,656 @@
++/*
++ * drivers/char/sun4i_g2d/g2d_driver.c
++ *
++ * (C) Copyright 2007-2012
++ * Allwinner Technology Co., Ltd. <www.allwinnertech.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include <linux/module.h>
++#include"g2d_driver_i.h"
++#include<linux/g2d_driver.h>
++#include"g2d.h"
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#define G2D_BYTE_ALIGN(x) ( ( (x + (4*1024-1)) >> 12) << 12)             /* alloc based on 4K byte */
++static struct g2d_alloc_struct boot_heap_head,boot_heap_tail;
++static struct info_mem g2d_mem[MAX_G2D_MEM_INDEX];
++static int	g2d_mem_sel = 0;
++
++static struct class	*g2d_class;
++static struct cdev	*g2d_cdev;
++static dev_t		 devid ;
++__g2d_drv_t			 g2d_ext_hd;
++__g2d_info_t		 para;
++
++static struct resource g2d_resource[2] =
++{
++	[0] = {
++		.start	= 0x01e80000,
++		.end	= 0x01e8ffff,
++		.flags	= IORESOURCE_MEM,
++	},
++
++	[1] = {
++		.start	= INTC_IRQNO_DE_MIX,
++		.end	= INTC_IRQNO_DE_MIX,
++		.flags	= IORESOURCE_IRQ,
++	},
++
++};
++
++struct platform_device g2d_device =
++{
++	.name           = "g2d",
++	.id		        = -1,
++	.num_resources  = ARRAY_SIZE(g2d_resource),
++	.resource	    = g2d_resource,
++	.dev            = {}
++};
++
++int drv_g2d_begin(void)
++{
++	int result = 0;
++
++	result = down_interruptible(g2d_ext_hd.g2d_finished_sem);
++	return result;
++}
++
++int drv_g2d_finish(void)
++{
++	int result = 0;
++
++	up(g2d_ext_hd.g2d_finished_sem);
++
++	return result;
++
++}
++
++extern unsigned long g2d_start;
++extern unsigned long g2d_size;
++
++__s32 g2d_create_heap(__u32 pHeapHead, __u32 nHeapSize)
++{
++	if(pHeapHead <(__u32)__va(0x40000000))
++	{
++	    ERR("Invalid pHeapHead:%x\n", pHeapHead);
++	    return -1;/* check valid */
++	}
++
++    boot_heap_head.size    = boot_heap_tail.size = 0;
++    boot_heap_head.address = pHeapHead;
++    boot_heap_tail.address = pHeapHead + nHeapSize;
++    boot_heap_head.next    = &boot_heap_tail;
++    boot_heap_tail.next    = 0;
++
++    INFO("head:%x,tail:%x\n" ,boot_heap_head.address, boot_heap_tail.address);
++    return 0;
++}
++
++__s32 drv_g2d_init(void)
++{
++    g2d_init_para init_para;
++
++    DBG("drv_g2d_init\n");
++    init_para.g2d_base		= (__u32)para.io;
++    init_para.g2d_begin		= drv_g2d_begin;
++    init_para.g2d_finish	= drv_g2d_finish;
++    memset(&g2d_ext_hd, 0, sizeof(__g2d_drv_t));
++    g2d_ext_hd.g2d_finished_sem = kmalloc(sizeof(struct semaphore),GFP_KERNEL | __GFP_ZERO);
++    if(!g2d_ext_hd.g2d_finished_sem)
++    {
++        WARNING("create g2d_finished_sem fail!\n");
++        return -1;
++    }
++    sema_init(g2d_ext_hd.g2d_finished_sem, 0);
++    g2d_ext_hd.event_sem = 0;
++    init_waitqueue_head(&g2d_ext_hd.queue);
++	g2d_init(&init_para);
++
++if(g2d_size !=0){
++    INFO("g2dmem: g2d_start=%x, g2d_size=%x\n", (unsigned int)g2d_start, (unsigned int)g2d_size);
++    g2d_create_heap((unsigned long)(__va(g2d_start)), g2d_size);
++}
++
++    return 0;
++}
++
++void *g2d_malloc(__u32 bytes_num)
++{
++	__u32 actual_bytes;
++	struct g2d_alloc_struct *ptr, *newptr;
++
++	if(!bytes_num)return 0;
++	actual_bytes = G2D_BYTE_ALIGN(bytes_num);
++	ptr = &boot_heap_head;
++	while(ptr && ptr->next)
++	{
++		if(ptr->next->address >= (ptr->address + ptr->size +(8*1024)+ actual_bytes))
++		{
++			break;
++		}
++		ptr = ptr->next;
++	}
++
++    if (!ptr->next)
++    {
++        ERR(" it has reached the boot_heap_tail of the heap now\n");
++        return 0;                   /* it has reached the boot_heap_tail of the heap now              */
++    }
++
++    newptr = (struct g2d_alloc_struct *)(ptr->address + ptr->size);
++                                                /* create a new node for the memory block             */
++    if (!newptr)
++    {
++        ERR(" create the node failed, can't manage the block\n");
++        return 0;                               /* create the node failed, can't manage the block     */
++    }
++
++    /* set the memory block chain, insert the node to the chain */
++    newptr->address = ptr->address + ptr->size + 4*1024;
++    newptr->size    = actual_bytes;
++    newptr->u_size  = bytes_num;
++    newptr->next    = ptr->next;
++    ptr->next       = newptr;
++
++    return (void *)newptr->address;
++}
++
++void g2d_free(void *p)
++{
++    struct g2d_alloc_struct *ptr, *prev;
++
++	if( p == NULL )
++		return;
++
++    ptr = &boot_heap_head;						/* look for the node which po__s32 this memory block                   */
++    while (ptr && ptr->next)
++    {
++        if (ptr->next->address == (__u32)p)
++            break;								/* find the node which need to be release                              */
++        ptr = ptr->next;
++    }
++
++	prev = ptr;
++	ptr = ptr->next;
++    if (!ptr) return;							/* the node is heap boot_heap_tail                                     */
++
++    prev->next = ptr->next;						/* delete the node which need be released from the memory block chain  */
++
++    return;
++}
++
++__s32 g2d_get_free_mem_index(void)
++{
++    __u32 i = 0;
++
++    for(i=0; i<MAX_G2D_MEM_INDEX; i++)
++    {
++        if(g2d_mem[i].b_used == 0)
++        {
++            return i;
++        }
++    }
++    return -1;
++}
++
++int g2d_mem_request(__u32 size)
++{
++if (g2d_size ==0){
++	__s32		 sel;
++	struct page	*page;
++	unsigned	 map_size = 0;
++
++    sel = g2d_get_free_mem_index();
++    if(sel < 0)
++    {
++        ERR("g2d_get_free_mem_index fail!\n");
++        return -EINVAL;
++    }
++
++	map_size = (size + 4095) & 0xfffff000;//4k å¯¹é½
++	page = alloc_pages(GFP_KERNEL,get_order(map_size));
++
++	if(page != NULL)
++	{
++		g2d_mem[sel].virt_addr = page_address(page);
++		if(g2d_mem[sel].virt_addr == 0)
++		{
++			free_pages((unsigned long)(page),get_order(map_size));
++			ERR("line %d:fail to alloc memory!\n",__LINE__);
++			return -ENOMEM;
++		}
++		memset(g2d_mem[sel].virt_addr,0,size);
++		g2d_mem[sel].phy_addr = virt_to_phys(g2d_mem[sel].virt_addr);
++	    g2d_mem[sel].mem_len = size;
++		g2d_mem[sel].b_used = 1;
++
++		INFO("map_g2d_memory[%d]: pa=%08lx va=%p size:%x\n",sel,g2d_mem[sel].phy_addr, g2d_mem[sel].virt_addr, size);
++		return sel;
++	}
++	else
++	{
++		ERR("fail to alloc memory!\n");
++		return -ENOMEM;
++	}
++}
++else{
++	__s32 sel;
++	__u32 ret = 0;
++
++    sel = g2d_get_free_mem_index();
++    if(sel < 0)
++    {
++        ERR("g2d_get_free_mem_index fail!\n");
++        return -EINVAL;
++    }
++
++	ret = (__u32)g2d_malloc(size);
++	if(ret != 0)
++	{
++	    g2d_mem[sel].virt_addr = (void*)ret;
++	    memset(g2d_mem[sel].virt_addr,0,size);
++		g2d_mem[sel].phy_addr = virt_to_phys(g2d_mem[sel].virt_addr);
++		g2d_mem[sel].mem_len = size;
++		g2d_mem[sel].b_used = 1;
++
++		INFO("map_g2d_memory[%d]: pa=%08lx va=%p size:%x\n",sel,g2d_mem[sel].phy_addr, g2d_mem[sel].virt_addr, size);
++		return sel;
++	}
++	else
++	{
++		ERR("fail to alloc reserved memory!\n");
++		return -ENOMEM;
++	}
++}
++}
++
++int g2d_mem_release(__u32 sel)
++{
++if(g2d_size ==0){
++	unsigned map_size = PAGE_ALIGN(g2d_mem[sel].mem_len);
++	unsigned page_size = map_size;
++
++	if(g2d_mem[sel].b_used == 0)
++	{
++	    ERR("mem not used in g2d_mem_release,%d\n",sel);
++		return -EINVAL;
++    }
++
++	free_pages((unsigned long)(g2d_mem[sel].virt_addr),get_order(page_size));
++	memset(&g2d_mem[sel],0,sizeof(struct info_mem));
++}
++else{
++
++	if(g2d_mem[sel].b_used == 0)
++	{
++	    ERR("mem not used in g2d_mem_release,%d\n",sel);
++		return -EINVAL;
++    }
++
++	g2d_free((void *)g2d_mem[sel].virt_addr);
++	memset(&g2d_mem[sel],0,sizeof(struct info_mem));
++}
++
++	return 0;
++}
++
++int g2d_mmap(struct file *file, struct vm_area_struct * vma)
++{
++	unsigned long physics;
++	unsigned long mypfn;
++	unsigned long vmsize = vma->vm_end-vma->vm_start;
++
++    if(g2d_mem[g2d_mem_sel].b_used == 0)
++    {
++        ERR("mem not used in g2d_mmap,%d\n",g2d_mem_sel);
++        return -EINVAL;
++    }
++
++	physics =  g2d_mem[g2d_mem_sel].phy_addr;
++	mypfn = physics >> PAGE_SHIFT;
++
++	if(remap_pfn_range(vma,vma->vm_start,mypfn,vmsize,vma->vm_page_prot))
++		return -EAGAIN;
++
++	return 0;
++}
++
++static int g2d_open(struct inode *inode, struct file *file)
++{
++	g2d_clk_on();
++	return 0;
++}
++
++static int g2d_release(struct inode *inode, struct file *file)
++{
++	g2d_clk_off();
++	return 0;
++}
++
++long g2d_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	__s32	ret = 0;
++
++	if(!mutex_trylock(&para.mutex)) {
++			mutex_lock(&para.mutex);
++	}
++	switch (cmd) {
++
++	/* Proceed to the operation */
++	case G2D_CMD_BITBLT:{
++		g2d_blt blit_para;
++		if(copy_from_user(&blit_para, (g2d_blt *)arg, sizeof(g2d_blt)))
++		{
++			kfree(&blit_para);
++			ret = -EFAULT;
++			goto err_noput;
++		}
++	    ret = g2d_blit(&blit_para);
++    	break;
++	}
++	case G2D_CMD_FILLRECT:{
++		g2d_fillrect fill_para;
++		if(copy_from_user(&fill_para, (g2d_fillrect *)arg, sizeof(g2d_fillrect)))
++		{
++			kfree(&fill_para);
++			ret = -EFAULT;
++			goto err_noput;
++		}
++	    ret = g2d_fill(&fill_para);
++    	break;
++	}
++	case G2D_CMD_STRETCHBLT:{
++		g2d_stretchblt stre_para;
++		if(copy_from_user(&stre_para, (g2d_stretchblt *)arg, sizeof(g2d_stretchblt)))
++		{
++			kfree(&stre_para);
++			ret = -EFAULT;
++			goto err_noput;
++		}
++	    ret = g2d_stretchblit(&stre_para);
++    	break;
++	}
++	case G2D_CMD_PALETTE_TBL:{
++		g2d_palette pale_para;
++		if(copy_from_user(&pale_para, (g2d_palette *)arg, sizeof(g2d_palette)))
++		{
++			kfree(&pale_para);
++			ret = -EFAULT;
++			goto err_noput;
++		}
++	    ret = g2d_set_palette_table(&pale_para);
++    	break;
++	}
++
++	/* just management memory for test */
++	case G2D_CMD_MEM_REQUEST:
++		ret =  g2d_mem_request(arg);
++		break;
++
++	case G2D_CMD_MEM_RELEASE:
++		ret =  g2d_mem_release(arg);
++		break;
++
++	case G2D_CMD_MEM_SELIDX:
++		g2d_mem_sel = arg;
++		break;
++
++	case G2D_CMD_MEM_GETADR:
++	    if(g2d_mem[arg].b_used)
++	    {
++		    ret = g2d_mem[arg].phy_addr;
++		}
++		else
++		{
++			ERR("mem not used in G2D_CMD_MEM_GETADR\n");
++		    ret = -1;
++		}
++		break;
++
++	/* Invalid IOCTL call */
++	default:
++		return -EINVAL;
++	}
++
++err_noput:
++	mutex_unlock(&para.mutex);
++
++	return ret;
++}
++
++static struct file_operations g2d_fops = {
++	.owner				= THIS_MODULE,
++	.open				= g2d_open,
++	.release			= g2d_release,
++	.unlocked_ioctl		= g2d_ioctl,
++	.mmap				= g2d_mmap,
++};
++
++static int g2d_probe(struct platform_device *pdev)
++{
++	int size;
++	int	ret = 0;
++	struct resource	*res;
++	__g2d_info_t	*info = NULL;
++
++	info = &para;
++	info->dev = &pdev->dev;
++	platform_set_drvdata(pdev,info);
++
++	/* get the clk */
++	g2d_openclk();
++//	g2d_clk_on();
++
++	/* get the memory region */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if(res == NULL)
++		{
++			ERR("failed to get memory register\n");
++			ret = -ENXIO;
++			goto  dealloc_fb;
++		}
++
++	/* reserve the memory */
++	size = (res->end - res->start) + 1;
++	info->mem = request_mem_region(res->start, size, pdev->name);
++	if(info->mem == NULL)
++		{
++			ERR("failed to get memory region\n");
++			ret = -ENOENT;
++			goto  relaese_regs;
++		}
++
++	/* map the memory */
++	info->io = ioremap(res->start, size);
++	if(info->io == NULL)
++		{
++			ERR("iormap() of register failed\n");
++			ret = -ENXIO;
++			goto  release_mem;
++		}
++
++	/* get the irq */
++	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	if(res == NULL)
++		{
++			ERR("failed to get irq resource\n");
++			ret = -ENXIO;
++			goto relaese_regs;
++		}
++
++	/* request the irq */
++	info->irq = res->start;
++	ret = request_irq(info->irq, g2d_handle_irq, 0, g2d_device.name, info);
++	if(ret)
++		{
++			ERR("failed to install irq resource\n");
++			goto relaese_regs;
++		}
++
++	drv_g2d_init();
++	mutex_init(&info->mutex);
++	return 0;
++
++	relaese_regs:
++		iounmap(info->io);
++	release_mem:
++		release_resource(info->mem);
++		kfree(info->mem);
++	dealloc_fb:
++		platform_set_drvdata(pdev, NULL);
++		kfree(info);
++
++	return ret;
++}
++
++static int g2d_remove(struct platform_device *pdev)
++{
++	__g2d_info_t *info = platform_get_drvdata(pdev);
++
++	/* power down */
++	g2d_closeclk();
++
++	free_irq(info->irq, info);
++	iounmap(info->io);
++	release_resource(info->mem);
++	kfree(info->mem);
++
++	platform_set_drvdata(pdev, NULL);
++
++	INFO("Driver unloaded succesfully.\n");
++	return 0;
++}
++
++static int g2d_suspend(struct platform_device *pdev, pm_message_t state)
++{
++	g2d_clk_off();
++	INFO("g2d_suspend succesfully.\n");
++
++	return 0;
++}
++
++static int g2d_resume(struct platform_device *pdev)
++{
++	INFO("%s. \n", __func__);
++	g2d_clk_on();
++	INFO("g2d_resume succesfully.\n");
++
++	return 0;
++}
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++void g2d_early_suspend(struct early_suspend *h)
++{
++//    g2d_suspend(NULL, PMSG_SUSPEND);
++}
++
++void g2d_late_resume(struct early_suspend *h)
++{
++//    g2d_resume(NULL);
++}
++
++static struct early_suspend g2d_early_suspend_handler =
++{
++    .level   = EARLY_SUSPEND_LEVEL_DISABLE_FB,
++	.suspend = g2d_early_suspend,
++	.resume = g2d_late_resume,
++};
++#endif
++
++
++static struct platform_driver g2d_driver = {
++	.probe          = g2d_probe,
++	.remove         = g2d_remove,
++#ifndef CONFIG_HAS_EARLYSUSPEND
++	.suspend        = g2d_suspend,
++	.resume         = g2d_resume,
++#else
++	.suspend        = NULL,
++	.resume         = NULL,
++#endif
++	.driver			=
++	{
++		.owner		= THIS_MODULE,
++		.name		= "g2d",
++	},
++};
++
++int __init g2d_module_init(void)
++{
++	int ret, err;
++
++    alloc_chrdev_region(&devid, 0, 1, "g2d_chrdev");
++    g2d_cdev = cdev_alloc();
++    cdev_init(g2d_cdev, &g2d_fops);
++    g2d_cdev->owner = THIS_MODULE;
++    err = cdev_add(g2d_cdev, devid, 1);
++    if (err)
++    {
++        ERR("I was assigned major number %d.\n", MAJOR(devid));
++        return -1;
++    }
++
++    g2d_class = class_create(THIS_MODULE, "g2d_class");
++    if (IS_ERR(g2d_class))
++    {
++        ERR("create class error\n");
++        return -1;
++    }
++
++	device_create(g2d_class, NULL, devid, NULL, "g2d");
++	ret = platform_device_register(&g2d_device);
++	if (ret == 0)
++	{
++		ret = platform_driver_register(&g2d_driver);
++	}
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++    register_early_suspend(&g2d_early_suspend_handler);
++#endif
++	INFO("Module initialized.major:%d\n", MAJOR(devid));
++	return ret;
++}
++
++static void __exit g2d_module_exit(void)
++{
++	INFO("g2d_module_exit\n");
++	kfree(g2d_ext_hd.g2d_finished_sem);
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++    unregister_early_suspend(&g2d_early_suspend_handler);
++#endif
++
++	platform_driver_unregister(&g2d_driver);
++	platform_device_unregister(&g2d_device);
++
++    device_destroy(g2d_class,  devid);
++    class_destroy(g2d_class);
++
++    cdev_del(g2d_cdev);
++}
++
++module_init(g2d_module_init);
++module_exit(g2d_module_exit);
++
++MODULE_AUTHOR("yupu_tang");
++MODULE_DESCRIPTION("g2d driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:g2d");
++
+diff --git a/drivers/char/sun4i_g2d/g2d_driver_i.h b/drivers/char/sun4i_g2d/g2d_driver_i.h
+new file mode 100644
+index 0000000..0ab05a4
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/g2d_driver_i.h
+@@ -0,0 +1,79 @@
++/* g2d_driver_i.h
++ *
++ * Copyright (c)	2011 xxxx Electronics
++ *					2011 Yupu Tang
++ *
++ * @ F23 G2D driver
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307USA
++ */
++
++#ifndef __G2D_DRIVER_I_H
++#define __G2D_DRIVER_I_H
++
++#include"g2d_bsp.h"
++
++#define G2D_DEBUG	1
++#ifdef	G2D_DEBUG
++#define	DBG(format, args...) printk(KERN_DEBUG "%s: " format, "G2D", ## args)
++#else
++#define	DBG(format, args...)
++#endif
++#define ERR(format, args...) printk(KERN_ERR "%s: " format, "G2D", ## args)
++#define WARNING(format, args...) printk(KERN_WARNING "%s: " format, "G2D", ## args)
++#define INFO(format, args...) printk(KERN_INFO "%s: " format, "G2D", ## args)
++
++#define MAX_G2D_MEM_INDEX	1000
++#define	INTC_IRQNO_DE_MIX	46
++
++struct info_mem
++{
++	unsigned long	 phy_addr;
++	void			*virt_addr;
++    __u32			 b_used;
++	__u32			 mem_len;
++};
++
++typedef struct
++{
++	struct device		*dev;
++	struct resource		*mem;
++	void __iomem		*io;
++	__u32				 irq;
++	struct mutex		 mutex;
++
++}__g2d_info_t;
++
++typedef struct
++{
++    __u32				 mid;
++    __u32				 used;
++    __u32				 status;
++    struct semaphore	*g2d_finished_sem;
++    struct semaphore	*event_sem;
++	wait_queue_head_t	 queue;
++	__u32				 finish_flag;
++
++}__g2d_drv_t;
++
++struct g2d_alloc_struct
++{
++	__u32	address;
++	__u32	size;
++	__u32	u_size;
++	struct	g2d_alloc_struct *next;
++};
++
++#endif	/* __G2D_DRIVER_I_H */
+\ No newline at end of file
+diff --git a/drivers/char/sun4i_g2d/g2d_regs.h b/drivers/char/sun4i_g2d/g2d_regs.h
+new file mode 100644
+index 0000000..160b137
+--- /dev/null
++++ b/drivers/char/sun4i_g2d/g2d_regs.h
+@@ -0,0 +1,156 @@
++/* g2d_regs.h
++ *
++ * Copyright (c)	2011 xxxx Electronics
++ *					2011 Yupu Tang
++ *
++ * @ F23 G2D driver
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307USA
++ */
++
++#ifndef __G2D_MIXER_REGS_H
++#define __G2D_MIXER_REGS_H
++
++/*
++	Graphics 2D General Registers
++*/
++#define G2D_BASE_ADDR			(0x01e80000)/* Base Address			*/
++#define G2D_CONTROL_REG			(0x00)		/* Control register			*/
++#define G2D_STATUS_REG			(0x04)		/* Status register		*/
++#define G2D_SCAN_ORDER_REG		(0x08)		/* DMA scan order control register		*/
++
++/*
++	Graphics 2D Input Address Parameter Setting Registers
++*/
++#define G2D_DMA_HADDR_REG		(0x0c)		/* Input DMA high 4 bits start addr register	*/
++#define G2D_DMA0_LADDR_REG		(0x10)		/* Input DMA0 low 32 bits start addr register	*/
++#define G2D_DMA1_LADDR_REG		(0x14)		/* Input DMA1 low 32 bits start addr register	*/
++#define G2D_DMA2_LADDR_REG		(0x18)		/* Input DMA2 low 32 bits start addr register	*/
++#define G2D_DMA3_LADDR_REG		(0x1c)		/* Input DMA3 low 32 bits start addr register	*/
++
++/*
++	Graphics 2D Input Linewidth Buffer Parameter Setting Registers
++*/
++#define G2D_DMA0_STRIDE_REG		(0x20)		/* Input DMA0 line stride register	*/
++#define G2D_DMA1_STRIDE_REG		(0x24)		/* Input DMA1 line stride register	*/
++#define G2D_DMA2_STRIDE_REG		(0x28)		/* Input DMA2 line stride register	*/
++#define G2D_DMA3_STRIDE_REG		(0x2c)		/* Input DMA3 line stride register	*/
++
++#define G2D_DMA0_SIZE_REG		(0x30)		/* Input DMA0 memory block size register	*/
++#define G2D_DMA1_SIZE_REG		(0x34)		/* Input DMA1 memory block size register	*/
++#define G2D_DMA2_SIZE_REG		(0x38)		/* Input DMA2 memory block size register	*/
++#define G2D_DMA3_SIZE_REG		(0x3c)		/* Input DMA3 memory block size register	*/
++#define G2D_DMA0_COOR_REG		(0x40)		/* Input DMA0 memory block coordinate register	*/
++#define G2D_DMA1_COOR_REG		(0x44)		/* Input DMA1 memory block coordinate register	*/
++#define G2D_DMA2_COOR_REG		(0x48)		/* Input DMA2 memory block coordinate register	*/
++#define G2D_DMA3_COOR_REG		(0x4c)		/* Input DMA3 memory block coordinate register	*/
++
++#define G2D_DMA0_CONTROL_REG	(0x50)		/* Input DMA0 control register	*/
++#define G2D_DMA1_CONTROL_REG	(0x54)		/* Input DMA1 control register	*/
++#define G2D_DMA2_CONTROL_REG	(0x58)		/* Input DMA2 control register	*/
++#define G2D_DMA3_CONTROL_REG	(0x5c)		/* Input DMA3 control register	*/
++
++#define G2D_DMA0_FILLCOLOR_REG	(0x60)		/* Input DMA0 fillcolor register	*/
++#define G2D_DMA1_FILLCOLOR_REG	(0x64)		/* Input DMA1 fillcolor register	*/
++#define G2D_DMA2_FILLCOLOR_REG	(0x68)		/* Input DMA2 fillcolor register	*/
++#define G2D_DMA3_FILLCOLOR_REG	(0x6c)		/* Input DMA3 fillcolor register	*/
++
++#define G2D_CSC0_CONTROL_REG	(0x74)		/* Color space converter0 control register	*/
++#define G2D_CSC1_CONTROL_REG	(0x78)		/* Color space converter1 control register	*/
++
++#define G2D_SCALER_CONTROL_REG	(0x80)		/* Scaler control register	*/
++#define G2D_SCALER_SIZE_REG		(0x84)		/* Scaler output size control register	*/
++#define G2D_SCALER_HFACTOR_REG	(0x88)		/* Scaler horizontal scaling factor register	*/
++#define G2D_SCALER_VFACTOR_REG	(0x8c)		/* Scaler vertical scaling factor register	*/
++#define G2D_SCALER_HPHASE_REG	(0x90)		/* Scaler horizontal start phase register	*/
++#define G2D_SCALER_VPHASE_REG	(0x94)		/* Scaler vertical start phase register	*/
++
++#define G2D_ROP_CONTROL_REG		(0xb0)		/* Rop control register	*/
++#define G2D_ROP_INDEX0_REG		(0xb8)		/* Rop index0 control table setting register	*/
++#define G2D_ROP_INDEX1_REG		(0xbc)		/* Rop index1 control table setting register	*/
++
++#define G2D_CK_CONTROL_REG		(0xc0)		/* Colorkey/alpha control register	*/
++#define G2D_CK_MINCOLOR_REG		(0xc4)		/* Colorkey min color control register	*/
++#define G2D_CK_MAXCOLOR_REG		(0xc8)		/* Colorkey max color control register	*/
++#define G2D_ROP_FILLCOLOR_REG	(0xcc)		/* Rop output fillcolor setting register	*/
++#define G2D_CSC2_CONTROL_REG	(0xd0)		/* Color space converter2 control register	*/
++#define G2D_OUTPUT_CONTROL_REG	(0xe0)		/* Output control register	*/
++#define G2D_OUTPUT_SIZE_REG		(0xe8)		/* Output size register	*/
++#define G2D_OUTPUT_HADDR_REG	(0xec)		/* Output high 4 bits address control register	*/
++#define G2D_OUTPUT0_LADDR_REG	(0xf0)		/* Output low 32 bits address control register	*/
++#define G2D_OUTPUT1_LADDR_REG	(0xf4)		/* Output low 32 bits address control register	*/
++#define G2D_OUTPUT2_LADDR_REG	(0xf8)		/* Output low 32 bits address control register	*/
++
++#define G2D_OUTPUT0_STRIDE_REG	(0x100)		/* Output channel0 line stride control register	*/
++#define G2D_OUTPUT1_STRIDE_REG	(0x104)		/* Output channel1 line stride control register	*/
++#define G2D_OUTPUT2_STRIDE_REG	(0x108)		/* Output channel2 line stride control register	*/
++#define G2D_OALPHA_CONTROL_REG	(0x120)		/* Output alpha control register	*/
++
++#define G2D_CSC01_ADDR_REG		(0x180)		/* CSC0/1 coefficient/constant start addr register(0x180-0x1ac)	*/
++#define G2D_CSC2_ADDR_REG		(0x1c0)		/* CSC2 coefficient/constant start addr register(0x1c0-0x1ec)	*/
++#define G2D_SCALER_HFILTER_REG	(0x200)		/* Scaling horizontal filtering coefficient ram block register(0x200-0x27c)	*/
++#define G2D_SCALER_VFILTER_REG	(0x280)		/* Scaling vertical filtering coefficient ram block register(0x280-0x2fc)	*/
++#define G2D_PALETTE_TAB_REG		(0x400)		/* Scaling horizontal filtering coefficient ram block register(0x400-0x7fc)	*/
++
++/* Mixer start control */
++#define G2D_ENABLE_CTRL			(1<<0)
++#define G2D_DISABLE_CTRL		(0<<0)
++#define G2D_START_CTRL			(1<<1)
++#define G2D_STOP_CTRL			(0<<1)
++#define G2D_FINISH_IRQ_ENABLE	(1<<8)
++#define G2D_ERROR_IRQ_ENABLE	(1<<9)
++
++/* Scan mode select */
++#define G2D_TOP_DOWN_LR		(0<<8)
++#define G2D_TOP_DOWN_RL		(1<<8)
++#define G2D_DOWN_TOP_LR		(2<<8)
++#define G2D_DOWN_TOP_RL		(3<<8)
++
++/* Input DMA setting */
++#define G2D_FILL_ENABLE		(1<<16)
++#define G2D_FILL_DISABLE	(0<<16)
++
++/* rotation/mirror mode */
++#define G2D_TRANSFORM_COPY			(0<<4)
++#define G2D_TRANSFORM_ROTATE90		(5<<4)
++#define G2D_TRANSFORM_ROTATE180		(3<<4)
++#define G2D_TRANSFORM_ROTATE270		(6<<4)
++#define G2D_TRANSFORM_HFLIP			(1<<4)
++#define G2D_TRANSFORM_VFLIP			(2<<4)
++#define G2D_TRANSFORM_MIRROR45		(7<<4)
++#define G2D_TRANSFORM_MIRROR135		(4<<4)
++
++/* Work Mode Select */
++#define G2D_NORMAL_MODE		(0<<1)
++#define G2D_PALETTE_MODE	(1<<1)
++#define G2D_IDMA_ENABLE		(1<<0)
++#define G2D_IDMA_DISABLE	(0<<0)
++
++/* Scaler Control Select */
++#define G2D_SCALER_DISABLE	(0<<0)
++#define G2D_SCALER_ENABLE	(1<<0)
++#define G2D_SCALER_4TAP4	(0<<4)
++#define G2D_SCALER_2TAP4	(1<<4)
++#define G2D_SCALER_1TAP4	(2<<4)
++
++#define get_bvalue(n)	(*((volatile __u8 *)(n)))          /* byte input */
++#define put_bvalue(n,c)	(*((volatile __u8 *)(n)) = (c))    /* byte output */
++#define get_hvalue(n)	(*((volatile __u16 *)(n)))         /* half word input */
++#define put_hvalue(n,c)	(*((volatile __u16 *)(n)) = (c))   /* half word output */
++#define get_wvalue(n)	(*((volatile __u32 *)(n)))          /* word input */
++#define put_wvalue(n,c)	(*((volatile __u32 *)(n)) = (c))    /* word output */
++
++#endif /* __G2D_MIXER_REGS_H */
++

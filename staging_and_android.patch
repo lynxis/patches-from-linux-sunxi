@@ -1,0 +1,2941 @@
+diff --git a/drivers/staging/android/Kconfig b/drivers/staging/android/Kconfig
+index eb1dee2..43d17c2 100644
+--- a/drivers/staging/android/Kconfig
++++ b/drivers/staging/android/Kconfig
+@@ -38,6 +38,20 @@ config ANDROID_RAM_CONSOLE
+ 	select ANDROID_PERSISTENT_RAM
+ 	default n
+ 
++config PERSISTENT_TRACER
++	bool "Persistent function tracer"
++	depends on HAVE_FUNCTION_TRACER
++	select FUNCTION_TRACER
++	select ANDROID_PERSISTENT_RAM
++	help
++	  persistent_trace traces function calls into a persistent ram
++	  buffer that can be decoded and dumped after reboot through
++	  /sys/kernel/debug/persistent_trace.  It can be used to
++	  determine what function was last called before a reset or
++	  panic.
++
++	  If unsure, say N.
++
+ config ANDROID_TIMED_OUTPUT
+ 	bool "Timed output class driver"
+ 	default y
+@@ -53,33 +67,25 @@ config ANDROID_LOW_MEMORY_KILLER
+ 	---help---
+ 	  Register processes to be killed when memory is low
+ 
++config ANDROID_LOW_MEMORY_KILLER_AUTODETECT_OOM_ADJ_VALUES
++	bool "Android Low Memory Killer: detect oom_adj values"
++	depends on ANDROID_LOW_MEMORY_KILLER
++	default y
++	---help---
++	  Detect oom_adj values written to
++	  /sys/module/lowmemorykiller/parameters/adj and convert them
++	  to oom_score_adj values.
++
+ source "drivers/staging/android/switch/Kconfig"
+ 
+-config ANDROID_INTF_ALARM
++config ANDROID_INTF_ALARM_DEV
+ 	bool "Android alarm driver"
+ 	depends on RTC_CLASS
+ 	default n
+ 	help
+ 	  Provides non-wakeup and rtc backed wakeup alarms based on rtc or
+ 	  elapsed realtime, and a non-wakeup alarm on the monotonic clock.
+-	  Also provides an interface to set the wall time which must be used
+-	  for elapsed realtime to work.
+-
+-config ANDROID_INTF_ALARM_DEV
+-	bool "Android alarm device"
+-	depends on ANDROID_INTF_ALARM
+-	default y
+-	help
+-	  Exports the alarm interface to user-space.
+-
+-config ANDROID_ALARM_OLDDRV_COMPAT
+-	bool "Android Alarm compatability with old drivers"
+-	depends on ANDROID_INTF_ALARM
+-	default n
+-	help
+-	  Provides preprocessor alias to aid compatability with
+-	  older out-of-tree drivers that use the Android Alarm
+-	  in-kernel API. This will be removed eventually.
++	  Also exports the alarm interface to user-space.
+ 
+ endif # if ANDROID
+ 
+diff --git a/drivers/staging/android/Makefile b/drivers/staging/android/Makefile
+index 9b6c9ed..8769e32 100644
+--- a/drivers/staging/android/Makefile
++++ b/drivers/staging/android/Makefile
+@@ -1,3 +1,5 @@
++ccflags-y += -I$(src)			# needed for trace events
++
+ obj-$(CONFIG_ANDROID_BINDER_IPC)	+= binder.o
+ obj-$(CONFIG_ASHMEM)			+= ashmem.o
+ obj-$(CONFIG_ANDROID_LOGGER)		+= logger.o
+@@ -7,5 +9,7 @@ obj-$(CONFIG_ANDROID_TIMED_OUTPUT)	+= timed_output.o
+ obj-$(CONFIG_ANDROID_TIMED_GPIO)	+= timed_gpio.o
+ obj-$(CONFIG_ANDROID_LOW_MEMORY_KILLER)	+= lowmemorykiller.o
+ obj-$(CONFIG_ANDROID_SWITCH)		+= switch/
+-obj-$(CONFIG_ANDROID_INTF_ALARM)	+= alarm.o
+ obj-$(CONFIG_ANDROID_INTF_ALARM_DEV)	+= alarm-dev.o
++obj-$(CONFIG_PERSISTENT_TRACER)		+= trace_persistent.o
++
++CFLAGS_REMOVE_trace_persistent.o = -pg
+diff --git a/drivers/staging/android/TODO b/drivers/staging/android/TODO
+deleted file mode 100644
+index b15fb0d..0000000
+--- a/drivers/staging/android/TODO
++++ /dev/null
+@@ -1,10 +0,0 @@
+-TODO:
+-	- checkpatch.pl cleanups
+-	- sparse fixes
+-	- rename files to be not so "generic"
+-	- make sure things build as modules properly
+-	- add proper arch dependencies as needed
+-	- audit userspace interfaces to make sure they are sane
+-
+-Please send patches to Greg Kroah-Hartman <greg@kroah.com> and Cc:
+-Brian Swetland <swetland@google.com>
+diff --git a/drivers/staging/android/alarm-dev.c b/drivers/staging/android/alarm-dev.c
+index 03efb34..e001fe5 100644
+--- a/drivers/staging/android/alarm-dev.c
++++ b/drivers/staging/android/alarm-dev.c
+@@ -22,24 +22,14 @@
+ #include <linux/sched.h>
+ #include <linux/spinlock.h>
+ #include <linux/uaccess.h>
++#include <linux/alarmtimer.h>
++#include <linux/wakelock.h>
+ #include "android_alarm.h"
+ 
+-/* XXX - Hack out wakelocks, while they are out of tree */
+-struct wake_lock {
+-	int i;
+-};
+-#define wake_lock(x)
+-#define wake_lock_timeout(x, y)
+-#define wake_unlock(x)
+-#define WAKE_LOCK_SUSPEND 0
+-#define wake_lock_init(x, y, z) ((x)->i = 1)
+-#define wake_lock_destroy(x)
+-
+ #define ANDROID_ALARM_PRINT_INFO (1U << 0)
+ #define ANDROID_ALARM_PRINT_IO (1U << 1)
+ #define ANDROID_ALARM_PRINT_INT (1U << 2)
+ 
+-
+ static int debug_mask = ANDROID_ALARM_PRINT_INFO;
+ module_param_named(debug_mask, debug_mask, int, S_IRUGO | S_IWUSR | S_IWGRP);
+ 
+@@ -66,7 +56,53 @@ static uint32_t alarm_pending;
+ static uint32_t alarm_enabled;
+ static uint32_t wait_pending;
+ 
+-static struct android_alarm alarms[ANDROID_ALARM_TYPE_COUNT];
++struct devalarm {
++	union {
++		struct hrtimer hrt;
++		struct alarm alrm;
++	} u;
++	enum android_alarm_type type;
++};
++
++static struct devalarm alarms[ANDROID_ALARM_TYPE_COUNT];
++
++
++static int is_wakeup(enum android_alarm_type type)
++{
++	if (type == ANDROID_ALARM_RTC_WAKEUP ||
++			type == ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP)
++		return 1;
++	return 0;
++}
++
++
++static void devalarm_start(struct devalarm *alrm, ktime_t exp)
++{
++	if (is_wakeup(alrm->type))
++		alarm_start(&alrm->u.alrm, exp);
++	else
++		hrtimer_start(&alrm->u.hrt, exp, HRTIMER_MODE_ABS);
++}
++
++
++static int devalarm_try_to_cancel(struct devalarm *alrm)
++{
++	int ret;
++	if (is_wakeup(alrm->type))
++		ret = alarm_try_to_cancel(&alrm->u.alrm);
++	else
++		ret = hrtimer_try_to_cancel(&alrm->u.hrt);
++	return ret;
++}
++
++static void devalarm_cancel(struct devalarm *alrm)
++{
++	if (is_wakeup(alrm->type))
++		alarm_cancel(&alrm->u.alrm);
++	else
++		hrtimer_cancel(&alrm->u.hrt);
++}
++
+ 
+ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+@@ -75,6 +111,8 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	struct timespec new_alarm_time;
+ 	struct timespec new_rtc_time;
+ 	struct timespec tmp_time;
++	struct rtc_time new_rtc_tm;
++	struct rtc_device *rtc_dev;
+ 	enum android_alarm_type alarm_type = ANDROID_ALARM_IOCTL_TO_TYPE(cmd);
+ 	uint32_t alarm_type_mask = 1U << alarm_type;
+ 
+@@ -101,7 +139,7 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	case ANDROID_ALARM_CLEAR(0):
+ 		spin_lock_irqsave(&alarm_slock, flags);
+ 		pr_alarm(IO, "alarm %d clear\n", alarm_type);
+-		android_alarm_try_to_cancel(&alarms[alarm_type]);
++		devalarm_try_to_cancel(&alarms[alarm_type]);
+ 		if (alarm_pending) {
+ 			alarm_pending &= ~alarm_type_mask;
+ 			if (!alarm_pending && !wait_pending)
+@@ -132,8 +170,7 @@ from_old_alarm_set:
+ 		pr_alarm(IO, "alarm %d set %ld.%09ld\n", alarm_type,
+ 			new_alarm_time.tv_sec, new_alarm_time.tv_nsec);
+ 		alarm_enabled |= alarm_type_mask;
+-		android_alarm_start_range(&alarms[alarm_type],
+-			timespec_to_ktime(new_alarm_time),
++		devalarm_start(&alarms[alarm_type],
+ 			timespec_to_ktime(new_alarm_time));
+ 		spin_unlock_irqrestore(&alarm_slock, flags);
+ 		if (ANDROID_ALARM_BASE_CMD(cmd) != ANDROID_ALARM_SET_AND_WAIT(0)
+@@ -163,7 +200,13 @@ from_old_alarm_set:
+ 			rv = -EFAULT;
+ 			goto err1;
+ 		}
+-		rv = android_alarm_set_rtc(new_rtc_time);
++		rtc_time_to_tm(new_rtc_time.tv_sec, &new_rtc_tm);
++		rtc_dev = alarmtimer_get_rtcdev();
++		rv = do_settimeofday(&new_rtc_time);
++		if (rv < 0)
++			goto err1;
++		if (rtc_dev)
++			rv = rtc_set_time(rtc_dev, &new_rtc_tm);
+ 		spin_lock_irqsave(&alarm_slock, flags);
+ 		alarm_pending |= ANDROID_ALARM_TIME_CHANGE_MASK;
+ 		wake_up(&alarm_wait_queue);
+@@ -179,8 +222,7 @@ from_old_alarm_set:
+ 			break;
+ 		case ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP:
+ 		case ANDROID_ALARM_ELAPSED_REALTIME:
+-			tmp_time =
+-				ktime_to_timespec(alarm_get_elapsed_realtime());
++			get_monotonic_boottime(&tmp_time);
+ 			break;
+ 		case ANDROID_ALARM_TYPE_COUNT:
+ 		case ANDROID_ALARM_SYSTEMTIME:
+@@ -224,7 +266,7 @@ static int alarm_release(struct inode *inode, struct file *file)
+ 				alarm_enabled &= ~alarm_type_mask;
+ 			}
+ 			spin_unlock_irqrestore(&alarm_slock, flags);
+-			android_alarm_cancel(&alarms[i]);
++			devalarm_cancel(&alarms[i]);
+ 			spin_lock_irqsave(&alarm_slock, flags);
+ 		}
+ 		if (alarm_pending | wait_pending) {
+@@ -241,12 +283,12 @@ static int alarm_release(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
+-static void alarm_triggered(struct android_alarm *alarm)
++static void devalarm_triggered(struct devalarm *alarm)
+ {
+ 	unsigned long flags;
+ 	uint32_t alarm_type_mask = 1U << alarm->type;
+ 
+-	pr_alarm(INT, "alarm_triggered type %d\n", alarm->type);
++	pr_alarm(INT, "devalarm_triggered type %d\n", alarm->type);
+ 	spin_lock_irqsave(&alarm_slock, flags);
+ 	if (alarm_enabled & alarm_type_mask) {
+ 		wake_lock_timeout(&alarm_wake_lock, 5 * HZ);
+@@ -257,6 +299,25 @@ static void alarm_triggered(struct android_alarm *alarm)
+ 	spin_unlock_irqrestore(&alarm_slock, flags);
+ }
+ 
++
++static enum hrtimer_restart devalarm_hrthandler(struct hrtimer *hrt)
++{
++	struct devalarm *devalrm = container_of(hrt, struct devalarm, u.hrt);
++
++	devalarm_triggered(devalrm);
++	return HRTIMER_NORESTART;
++}
++
++static enum alarmtimer_restart devalarm_alarmhandler(struct alarm *alrm,
++							ktime_t now)
++{
++	struct devalarm *devalrm = container_of(alrm, struct devalarm, u.alrm);
++
++	devalarm_triggered(devalrm);
++	return ALARMTIMER_NORESTART;
++}
++
++
+ static const struct file_operations alarm_fops = {
+ 	.owner = THIS_MODULE,
+ 	.unlocked_ioctl = alarm_ioctl,
+@@ -279,8 +340,23 @@ static int __init alarm_dev_init(void)
+ 	if (err)
+ 		return err;
+ 
+-	for (i = 0; i < ANDROID_ALARM_TYPE_COUNT; i++)
+-		android_alarm_init(&alarms[i], i, alarm_triggered);
++	alarm_init(&alarms[ANDROID_ALARM_RTC_WAKEUP].u.alrm,
++			ALARM_REALTIME, devalarm_alarmhandler);
++	hrtimer_init(&alarms[ANDROID_ALARM_RTC].u.hrt,
++			CLOCK_REALTIME, HRTIMER_MODE_ABS);
++	alarm_init(&alarms[ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP].u.alrm,
++			ALARM_BOOTTIME, devalarm_alarmhandler);
++	hrtimer_init(&alarms[ANDROID_ALARM_ELAPSED_REALTIME].u.hrt,
++			CLOCK_BOOTTIME, HRTIMER_MODE_ABS);
++	hrtimer_init(&alarms[ANDROID_ALARM_SYSTEMTIME].u.hrt,
++			CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
++
++	for (i = 0; i < ANDROID_ALARM_TYPE_COUNT; i++) {
++		alarms[i].type = i;
++		if (!is_wakeup(i))
++			alarms[i].u.hrt.function = devalarm_hrthandler;
++	}
++
+ 	wake_lock_init(&alarm_wake_lock, WAKE_LOCK_SUSPEND, "alarm");
+ 
+ 	return 0;
+diff --git a/drivers/staging/android/alarm.c b/drivers/staging/android/alarm.c
+deleted file mode 100644
+index c68950b..0000000
+--- a/drivers/staging/android/alarm.c
++++ /dev/null
+@@ -1,601 +0,0 @@
+-/* drivers/rtc/alarm.c
+- *
+- * Copyright (C) 2007-2009 Google, Inc.
+- *
+- * This software is licensed under the terms of the GNU General Public
+- * License version 2, as published by the Free Software Foundation, and
+- * may be copied, distributed, and modified under those terms.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- */
+-
+-#include <linux/time.h>
+-#include <linux/module.h>
+-#include <linux/device.h>
+-#include <linux/miscdevice.h>
+-#include <linux/platform_device.h>
+-#include <linux/rtc.h>
+-#include <linux/sched.h>
+-#include <linux/spinlock.h>
+-#include "android_alarm.h"
+-
+-/* XXX - Hack out wakelocks, while they are out of tree */
+-struct wake_lock {
+-	int i;
+-};
+-#define wake_lock(x)
+-#define wake_lock_timeout(x, y)
+-#define wake_unlock(x)
+-#define WAKE_LOCK_SUSPEND 0
+-#define wake_lock_init(x, y, z) ((x)->i = 1)
+-#define wake_lock_destroy(x)
+-
+-#define ANDROID_ALARM_PRINT_ERROR (1U << 0)
+-#define ANDROID_ALARM_PRINT_INIT_STATUS (1U << 1)
+-#define ANDROID_ALARM_PRINT_TSET (1U << 2)
+-#define ANDROID_ALARM_PRINT_CALL (1U << 3)
+-#define ANDROID_ALARM_PRINT_SUSPEND (1U << 4)
+-#define ANDROID_ALARM_PRINT_INT (1U << 5)
+-#define ANDROID_ALARM_PRINT_FLOW (1U << 6)
+-
+-static int debug_mask = ANDROID_ALARM_PRINT_ERROR | \
+-			ANDROID_ALARM_PRINT_INIT_STATUS;
+-module_param_named(debug_mask, debug_mask, int, S_IRUGO | S_IWUSR | S_IWGRP);
+-
+-#define pr_alarm(debug_level_mask, args...) \
+-	do { \
+-		if (debug_mask & ANDROID_ALARM_PRINT_##debug_level_mask) { \
+-			pr_info(args); \
+-		} \
+-	} while (0)
+-
+-#define ANDROID_ALARM_WAKEUP_MASK ( \
+-	ANDROID_ALARM_RTC_WAKEUP_MASK | \
+-	ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP_MASK)
+-
+-/* support old usespace code */
+-#define ANDROID_ALARM_SET_OLD               _IOW('a', 2, time_t) /* set alarm */
+-#define ANDROID_ALARM_SET_AND_WAIT_OLD      _IOW('a', 3, time_t)
+-
+-struct alarm_queue {
+-	struct rb_root alarms;
+-	struct rb_node *first;
+-	struct hrtimer timer;
+-	ktime_t delta;
+-	bool stopped;
+-	ktime_t stopped_time;
+-};
+-
+-static struct rtc_device *alarm_rtc_dev;
+-static DEFINE_SPINLOCK(alarm_slock);
+-static DEFINE_MUTEX(alarm_setrtc_mutex);
+-static struct wake_lock alarm_rtc_wake_lock;
+-static struct platform_device *alarm_platform_dev;
+-struct alarm_queue alarms[ANDROID_ALARM_TYPE_COUNT];
+-static bool suspended;
+-
+-static void update_timer_locked(struct alarm_queue *base, bool head_removed)
+-{
+-	struct android_alarm *alarm;
+-	bool is_wakeup = base == &alarms[ANDROID_ALARM_RTC_WAKEUP] ||
+-			base == &alarms[ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP];
+-
+-	if (base->stopped) {
+-		pr_alarm(FLOW, "changed alarm while setting the wall time\n");
+-		return;
+-	}
+-
+-	if (is_wakeup && !suspended && head_removed)
+-		wake_unlock(&alarm_rtc_wake_lock);
+-
+-	if (!base->first)
+-		return;
+-
+-	alarm = container_of(base->first, struct android_alarm, node);
+-
+-	pr_alarm(FLOW, "selected alarm, type %d, func %pF at %lld\n",
+-		alarm->type, alarm->function, ktime_to_ns(alarm->expires));
+-
+-	if (is_wakeup && suspended) {
+-		pr_alarm(FLOW, "changed alarm while suspened\n");
+-		wake_lock_timeout(&alarm_rtc_wake_lock, 1 * HZ);
+-		return;
+-	}
+-
+-	hrtimer_try_to_cancel(&base->timer);
+-	base->timer.node.expires = ktime_add(base->delta, alarm->expires);
+-	base->timer._softexpires = ktime_add(base->delta, alarm->softexpires);
+-	hrtimer_start_expires(&base->timer, HRTIMER_MODE_ABS);
+-}
+-
+-static void alarm_enqueue_locked(struct android_alarm *alarm)
+-{
+-	struct alarm_queue *base = &alarms[alarm->type];
+-	struct rb_node **link = &base->alarms.rb_node;
+-	struct rb_node *parent = NULL;
+-	struct android_alarm *entry;
+-	int leftmost = 1;
+-	bool was_first = false;
+-
+-	pr_alarm(FLOW, "added alarm, type %d, func %pF at %lld\n",
+-		alarm->type, alarm->function, ktime_to_ns(alarm->expires));
+-
+-	if (base->first == &alarm->node) {
+-		base->first = rb_next(&alarm->node);
+-		was_first = true;
+-	}
+-	if (!RB_EMPTY_NODE(&alarm->node)) {
+-		rb_erase(&alarm->node, &base->alarms);
+-		RB_CLEAR_NODE(&alarm->node);
+-	}
+-
+-	while (*link) {
+-		parent = *link;
+-		entry = rb_entry(parent, struct android_alarm, node);
+-		/*
+-		* We dont care about collisions. Nodes with
+-		* the same expiry time stay together.
+-		*/
+-		if (alarm->expires.tv64 < entry->expires.tv64) {
+-			link = &(*link)->rb_left;
+-		} else {
+-			link = &(*link)->rb_right;
+-			leftmost = 0;
+-		}
+-	}
+-	if (leftmost)
+-		base->first = &alarm->node;
+-	if (leftmost || was_first)
+-		update_timer_locked(base, was_first);
+-
+-	rb_link_node(&alarm->node, parent, link);
+-	rb_insert_color(&alarm->node, &base->alarms);
+-}
+-
+-/**
+- * android_alarm_init - initialize an alarm
+- * @alarm:	the alarm to be initialized
+- * @type:	the alarm type to be used
+- * @function:	alarm callback function
+- */
+-void android_alarm_init(struct android_alarm *alarm,
+-	enum android_alarm_type type, void (*function)(struct android_alarm *))
+-{
+-	RB_CLEAR_NODE(&alarm->node);
+-	alarm->type = type;
+-	alarm->function = function;
+-
+-	pr_alarm(FLOW, "created alarm, type %d, func %pF\n", type, function);
+-}
+-
+-
+-/**
+- * android_alarm_start_range - (re)start an alarm
+- * @alarm:	the alarm to be added
+- * @start:	earliest expiry time
+- * @end:	expiry time
+- */
+-void android_alarm_start_range(struct android_alarm *alarm, ktime_t start,
+-								ktime_t end)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	alarm->softexpires = start;
+-	alarm->expires = end;
+-	alarm_enqueue_locked(alarm);
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-}
+-
+-/**
+- * android_alarm_try_to_cancel - try to deactivate an alarm
+- * @alarm:	alarm to stop
+- *
+- * Returns:
+- *  0 when the alarm was not active
+- *  1 when the alarm was active
+- * -1 when the alarm may currently be excuting the callback function and
+- *    cannot be stopped (it may also be inactive)
+- */
+-int android_alarm_try_to_cancel(struct android_alarm *alarm)
+-{
+-	struct alarm_queue *base = &alarms[alarm->type];
+-	unsigned long flags;
+-	bool first = false;
+-	int ret = 0;
+-
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	if (!RB_EMPTY_NODE(&alarm->node)) {
+-		pr_alarm(FLOW, "canceled alarm, type %d, func %pF at %lld\n",
+-			alarm->type, alarm->function,
+-			ktime_to_ns(alarm->expires));
+-		ret = 1;
+-		if (base->first == &alarm->node) {
+-			base->first = rb_next(&alarm->node);
+-			first = true;
+-		}
+-		rb_erase(&alarm->node, &base->alarms);
+-		RB_CLEAR_NODE(&alarm->node);
+-		if (first)
+-			update_timer_locked(base, true);
+-	} else
+-		pr_alarm(FLOW, "tried to cancel alarm, type %d, func %pF\n",
+-			alarm->type, alarm->function);
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-	if (!ret && hrtimer_callback_running(&base->timer))
+-		ret = -1;
+-	return ret;
+-}
+-
+-/**
+- * android_alarm_cancel - cancel an alarm and wait for the handler to finish.
+- * @alarm:	the alarm to be cancelled
+- *
+- * Returns:
+- *  0 when the alarm was not active
+- *  1 when the alarm was active
+- */
+-int android_alarm_cancel(struct android_alarm *alarm)
+-{
+-	for (;;) {
+-		int ret = android_alarm_try_to_cancel(alarm);
+-		if (ret >= 0)
+-			return ret;
+-		cpu_relax();
+-	}
+-}
+-
+-/**
+- * alarm_set_rtc - set the kernel and rtc walltime
+- * @new_time:	timespec value containing the new time
+- */
+-int android_alarm_set_rtc(struct timespec new_time)
+-{
+-	int i;
+-	int ret;
+-	unsigned long flags;
+-	struct rtc_time rtc_new_rtc_time;
+-	struct timespec tmp_time;
+-
+-	rtc_time_to_tm(new_time.tv_sec, &rtc_new_rtc_time);
+-
+-	pr_alarm(TSET, "set rtc %ld %ld - rtc %02d:%02d:%02d %02d/%02d/%04d\n",
+-		new_time.tv_sec, new_time.tv_nsec,
+-		rtc_new_rtc_time.tm_hour, rtc_new_rtc_time.tm_min,
+-		rtc_new_rtc_time.tm_sec, rtc_new_rtc_time.tm_mon + 1,
+-		rtc_new_rtc_time.tm_mday,
+-		rtc_new_rtc_time.tm_year + 1900);
+-
+-	mutex_lock(&alarm_setrtc_mutex);
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	wake_lock(&alarm_rtc_wake_lock);
+-	getnstimeofday(&tmp_time);
+-	for (i = 0; i < ANDROID_ALARM_SYSTEMTIME; i++) {
+-		hrtimer_try_to_cancel(&alarms[i].timer);
+-		alarms[i].stopped = true;
+-		alarms[i].stopped_time = timespec_to_ktime(tmp_time);
+-	}
+-	alarms[ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP].delta =
+-		alarms[ANDROID_ALARM_ELAPSED_REALTIME].delta =
+-		ktime_sub(alarms[ANDROID_ALARM_ELAPSED_REALTIME].delta,
+-			timespec_to_ktime(timespec_sub(tmp_time, new_time)));
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-	ret = do_settimeofday(&new_time);
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	for (i = 0; i < ANDROID_ALARM_SYSTEMTIME; i++) {
+-		alarms[i].stopped = false;
+-		update_timer_locked(&alarms[i], false);
+-	}
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-	if (ret < 0) {
+-		pr_alarm(ERROR, "alarm_set_rtc: Failed to set time\n");
+-		goto err;
+-	}
+-	if (!alarm_rtc_dev) {
+-		pr_alarm(ERROR,
+-			"alarm_set_rtc: no RTC, time will be lost on reboot\n");
+-		goto err;
+-	}
+-	ret = rtc_set_time(alarm_rtc_dev, &rtc_new_rtc_time);
+-	if (ret < 0)
+-		pr_alarm(ERROR, "alarm_set_rtc: "
+-			"Failed to set RTC, time will be lost on reboot\n");
+-err:
+-	wake_unlock(&alarm_rtc_wake_lock);
+-	mutex_unlock(&alarm_setrtc_mutex);
+-	return ret;
+-}
+-
+-/**
+- * alarm_get_elapsed_realtime - get the elapsed real time in ktime_t format
+- *
+- * returns the time in ktime_t format
+- */
+-ktime_t alarm_get_elapsed_realtime(void)
+-{
+-	ktime_t now;
+-	unsigned long flags;
+-	struct alarm_queue *base = &alarms[ANDROID_ALARM_ELAPSED_REALTIME];
+-
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	now = base->stopped ? base->stopped_time : ktime_get_real();
+-	now = ktime_sub(now, base->delta);
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-	return now;
+-}
+-
+-static enum hrtimer_restart alarm_timer_triggered(struct hrtimer *timer)
+-{
+-	struct alarm_queue *base;
+-	struct android_alarm *alarm;
+-	unsigned long flags;
+-	ktime_t now;
+-
+-	spin_lock_irqsave(&alarm_slock, flags);
+-
+-	base = container_of(timer, struct alarm_queue, timer);
+-	now = base->stopped ? base->stopped_time : hrtimer_cb_get_time(timer);
+-	now = ktime_sub(now, base->delta);
+-
+-	pr_alarm(INT, "alarm_timer_triggered type %ld at %lld\n",
+-		base - alarms, ktime_to_ns(now));
+-
+-	while (base->first) {
+-		alarm = container_of(base->first, struct android_alarm, node);
+-		if (alarm->softexpires.tv64 > now.tv64) {
+-			pr_alarm(FLOW, "don't call alarm, %pF, %lld (s %lld)\n",
+-				alarm->function, ktime_to_ns(alarm->expires),
+-				ktime_to_ns(alarm->softexpires));
+-			break;
+-		}
+-		base->first = rb_next(&alarm->node);
+-		rb_erase(&alarm->node, &base->alarms);
+-		RB_CLEAR_NODE(&alarm->node);
+-		pr_alarm(CALL, "call alarm, type %d, func %pF, %lld (s %lld)\n",
+-			alarm->type, alarm->function,
+-			ktime_to_ns(alarm->expires),
+-			ktime_to_ns(alarm->softexpires));
+-		spin_unlock_irqrestore(&alarm_slock, flags);
+-		alarm->function(alarm);
+-		spin_lock_irqsave(&alarm_slock, flags);
+-	}
+-	if (!base->first)
+-		pr_alarm(FLOW, "no more alarms of type %ld\n", base - alarms);
+-	update_timer_locked(base, true);
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-	return HRTIMER_NORESTART;
+-}
+-
+-static void alarm_triggered_func(void *p)
+-{
+-	struct rtc_device *rtc = alarm_rtc_dev;
+-	if (!(rtc->irq_data & RTC_AF))
+-		return;
+-	pr_alarm(INT, "rtc alarm triggered\n");
+-	wake_lock_timeout(&alarm_rtc_wake_lock, 1 * HZ);
+-}
+-
+-static int alarm_suspend(struct platform_device *pdev, pm_message_t state)
+-{
+-	int                 err = 0;
+-	unsigned long       flags;
+-	struct rtc_wkalrm   rtc_alarm;
+-	struct rtc_time     rtc_current_rtc_time;
+-	unsigned long       rtc_current_time;
+-	unsigned long       rtc_alarm_time;
+-	struct timespec     rtc_delta;
+-	struct timespec     wall_time;
+-	struct alarm_queue *wakeup_queue = NULL;
+-	struct alarm_queue *tmp_queue = NULL;
+-
+-	pr_alarm(SUSPEND, "alarm_suspend(%p, %d)\n", pdev, state.event);
+-
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	suspended = true;
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-
+-	hrtimer_cancel(&alarms[ANDROID_ALARM_RTC_WAKEUP].timer);
+-	hrtimer_cancel(&alarms[
+-			ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP].timer);
+-
+-	tmp_queue = &alarms[ANDROID_ALARM_RTC_WAKEUP];
+-	if (tmp_queue->first)
+-		wakeup_queue = tmp_queue;
+-	tmp_queue = &alarms[ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP];
+-	if (tmp_queue->first && (!wakeup_queue ||
+-				hrtimer_get_expires(&tmp_queue->timer).tv64 <
+-				hrtimer_get_expires(&wakeup_queue->timer).tv64))
+-		wakeup_queue = tmp_queue;
+-	if (wakeup_queue) {
+-		rtc_read_time(alarm_rtc_dev, &rtc_current_rtc_time);
+-		getnstimeofday(&wall_time);
+-		rtc_tm_to_time(&rtc_current_rtc_time, &rtc_current_time);
+-		set_normalized_timespec(&rtc_delta,
+-					wall_time.tv_sec - rtc_current_time,
+-					wall_time.tv_nsec);
+-
+-		rtc_alarm_time = timespec_sub(ktime_to_timespec(
+-			hrtimer_get_expires(&wakeup_queue->timer)),
+-			rtc_delta).tv_sec;
+-
+-		rtc_time_to_tm(rtc_alarm_time, &rtc_alarm.time);
+-		rtc_alarm.enabled = 1;
+-		rtc_set_alarm(alarm_rtc_dev, &rtc_alarm);
+-		rtc_read_time(alarm_rtc_dev, &rtc_current_rtc_time);
+-		rtc_tm_to_time(&rtc_current_rtc_time, &rtc_current_time);
+-		pr_alarm(SUSPEND,
+-			"rtc alarm set at %ld, now %ld, rtc delta %ld.%09ld\n",
+-			rtc_alarm_time, rtc_current_time,
+-			rtc_delta.tv_sec, rtc_delta.tv_nsec);
+-		if (rtc_current_time + 1 >= rtc_alarm_time) {
+-			pr_alarm(SUSPEND, "alarm about to go off\n");
+-			memset(&rtc_alarm, 0, sizeof(rtc_alarm));
+-			rtc_alarm.enabled = 0;
+-			rtc_set_alarm(alarm_rtc_dev, &rtc_alarm);
+-
+-			spin_lock_irqsave(&alarm_slock, flags);
+-			suspended = false;
+-			wake_lock_timeout(&alarm_rtc_wake_lock, 2 * HZ);
+-			update_timer_locked(&alarms[ANDROID_ALARM_RTC_WAKEUP],
+-									false);
+-			update_timer_locked(&alarms[
+-				ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP], false);
+-			err = -EBUSY;
+-			spin_unlock_irqrestore(&alarm_slock, flags);
+-		}
+-	}
+-	return err;
+-}
+-
+-static int alarm_resume(struct platform_device *pdev)
+-{
+-	struct rtc_wkalrm alarm;
+-	unsigned long       flags;
+-
+-	pr_alarm(SUSPEND, "alarm_resume(%p)\n", pdev);
+-
+-	memset(&alarm, 0, sizeof(alarm));
+-	alarm.enabled = 0;
+-	rtc_set_alarm(alarm_rtc_dev, &alarm);
+-
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	suspended = false;
+-	update_timer_locked(&alarms[ANDROID_ALARM_RTC_WAKEUP], false);
+-	update_timer_locked(&alarms[ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP],
+-									false);
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-
+-	return 0;
+-}
+-
+-static struct rtc_task alarm_rtc_task = {
+-	.func = alarm_triggered_func
+-};
+-
+-static int rtc_alarm_add_device(struct device *dev,
+-				struct class_interface *class_intf)
+-{
+-	int err;
+-	struct rtc_device *rtc = to_rtc_device(dev);
+-
+-	mutex_lock(&alarm_setrtc_mutex);
+-
+-	if (alarm_rtc_dev) {
+-		err = -EBUSY;
+-		goto err1;
+-	}
+-
+-	alarm_platform_dev =
+-		platform_device_register_simple("alarm", -1, NULL, 0);
+-	if (IS_ERR(alarm_platform_dev)) {
+-		err = PTR_ERR(alarm_platform_dev);
+-		goto err2;
+-	}
+-	err = rtc_irq_register(rtc, &alarm_rtc_task);
+-	if (err)
+-		goto err3;
+-	alarm_rtc_dev = rtc;
+-	pr_alarm(INIT_STATUS, "using rtc device, %s, for alarms", rtc->name);
+-	mutex_unlock(&alarm_setrtc_mutex);
+-
+-	return 0;
+-
+-err3:
+-	platform_device_unregister(alarm_platform_dev);
+-err2:
+-err1:
+-	mutex_unlock(&alarm_setrtc_mutex);
+-	return err;
+-}
+-
+-static void rtc_alarm_remove_device(struct device *dev,
+-				    struct class_interface *class_intf)
+-{
+-	if (dev == &alarm_rtc_dev->dev) {
+-		pr_alarm(INIT_STATUS, "lost rtc device for alarms");
+-		rtc_irq_unregister(alarm_rtc_dev, &alarm_rtc_task);
+-		platform_device_unregister(alarm_platform_dev);
+-		alarm_rtc_dev = NULL;
+-	}
+-}
+-
+-static struct class_interface rtc_alarm_interface = {
+-	.add_dev = &rtc_alarm_add_device,
+-	.remove_dev = &rtc_alarm_remove_device,
+-};
+-
+-static struct platform_driver alarm_driver = {
+-	.suspend = alarm_suspend,
+-	.resume = alarm_resume,
+-	.driver = {
+-		.name = "alarm"
+-	}
+-};
+-
+-static int __init alarm_late_init(void)
+-{
+-	unsigned long   flags;
+-	struct timespec tmp_time, system_time;
+-
+-	/* this needs to run after the rtc is read at boot */
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	/* We read the current rtc and system time so we can later calulate
+-	 * elasped realtime to be (boot_systemtime + rtc - boot_rtc) ==
+-	 * (rtc - (boot_rtc - boot_systemtime))
+-	 */
+-	getnstimeofday(&tmp_time);
+-	ktime_get_ts(&system_time);
+-	alarms[ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP].delta =
+-		alarms[ANDROID_ALARM_ELAPSED_REALTIME].delta =
+-			timespec_to_ktime(timespec_sub(tmp_time, system_time));
+-
+-	spin_unlock_irqrestore(&alarm_slock, flags);
+-	return 0;
+-}
+-
+-static int __init alarm_driver_init(void)
+-{
+-	int err;
+-	int i;
+-
+-	for (i = 0; i < ANDROID_ALARM_SYSTEMTIME; i++) {
+-		hrtimer_init(&alarms[i].timer,
+-				CLOCK_REALTIME, HRTIMER_MODE_ABS);
+-		alarms[i].timer.function = alarm_timer_triggered;
+-	}
+-	hrtimer_init(&alarms[ANDROID_ALARM_SYSTEMTIME].timer,
+-		     CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+-	alarms[ANDROID_ALARM_SYSTEMTIME].timer.function = alarm_timer_triggered;
+-	err = platform_driver_register(&alarm_driver);
+-	if (err < 0)
+-		goto err1;
+-	wake_lock_init(&alarm_rtc_wake_lock, WAKE_LOCK_SUSPEND, "alarm_rtc");
+-	rtc_alarm_interface.class = rtc_class;
+-	err = class_interface_register(&rtc_alarm_interface);
+-	if (err < 0)
+-		goto err2;
+-
+-	return 0;
+-
+-err2:
+-	wake_lock_destroy(&alarm_rtc_wake_lock);
+-	platform_driver_unregister(&alarm_driver);
+-err1:
+-	return err;
+-}
+-
+-static void  __exit alarm_exit(void)
+-{
+-	class_interface_unregister(&rtc_alarm_interface);
+-	wake_lock_destroy(&alarm_rtc_wake_lock);
+-	platform_driver_unregister(&alarm_driver);
+-}
+-
+-late_initcall(alarm_late_init);
+-module_init(alarm_driver_init);
+-module_exit(alarm_exit);
+-
+diff --git a/drivers/staging/android/android_alarm.h b/drivers/staging/android/android_alarm.h
+index 6eecbde..d0cafd6 100644
+--- a/drivers/staging/android/android_alarm.h
++++ b/drivers/staging/android/android_alarm.h
+@@ -33,65 +33,6 @@ enum android_alarm_type {
+ 	/* ANDROID_ALARM_TIME_CHANGE = 16 */
+ };
+ 
+-#ifdef __KERNEL__
+-
+-#include <linux/ktime.h>
+-#include <linux/rbtree.h>
+-
+-/*
+- * The alarm interface is similar to the hrtimer interface but adds support
+- * for wakeup from suspend. It also adds an elapsed realtime clock that can
+- * be used for periodic timers that need to keep runing while the system is
+- * suspended and not be disrupted when the wall time is set.
+- */
+-
+-/**
+- * struct alarm - the basic alarm structure
+- * @node:	red black tree node for time ordered insertion
+- * @type:	alarm type. rtc/elapsed-realtime/systemtime, wakeup/non-wakeup.
+- * @softexpires: the absolute earliest expiry time of the alarm.
+- * @expires:	the absolute expiry time.
+- * @function:	alarm expiry callback function
+- *
+- * The alarm structure must be initialized by alarm_init()
+- *
+- */
+-
+-struct android_alarm {
+-	struct rb_node		node;
+-	enum android_alarm_type type;
+-	ktime_t			softexpires;
+-	ktime_t			expires;
+-	void			(*function)(struct android_alarm *);
+-};
+-
+-void android_alarm_init(struct android_alarm *alarm,
+-	enum android_alarm_type type, void (*function)(struct android_alarm *));
+-void android_alarm_start_range(struct android_alarm *alarm, ktime_t start,
+-								ktime_t end);
+-int android_alarm_try_to_cancel(struct android_alarm *alarm);
+-int android_alarm_cancel(struct android_alarm *alarm);
+-ktime_t alarm_get_elapsed_realtime(void);
+-
+-/* set rtc while preserving elapsed realtime */
+-int android_alarm_set_rtc(const struct timespec ts);
+-
+-#ifdef CONFIG_ANDROID_ALARM_OLDDRV_COMPAT
+-/*
+- * Some older drivers depend on the old API,
+- * so provide compatability macros for now.
+- */
+-#define alarm android_alarm
+-#define alarm_init(x, y, z) android_alarm_init(x, y, z)
+-#define alarm_start_range(x, y, z) android_alarm_start_range(x, y, z)
+-#define alarm_try_to_cancel(x) android_alarm_try_to_cancel(x)
+-#define alarm_cancel(x) android_alarm_cancel(x)
+-#define alarm_set_rtc(x) android_alarm_set_rtc(x)
+-#endif
+-
+-
+-#endif
+-
+ enum android_alarm_return_flags {
+ 	ANDROID_ALARM_RTC_WAKEUP_MASK = 1U << ANDROID_ALARM_RTC_WAKEUP,
+ 	ANDROID_ALARM_RTC_MASK = 1U << ANDROID_ALARM_RTC,
+diff --git a/drivers/staging/android/ashmem.c b/drivers/staging/android/ashmem.c
+index 9f1f27e..bda20bf 100644
+--- a/drivers/staging/android/ashmem.c
++++ b/drivers/staging/android/ashmem.c
+@@ -314,21 +314,13 @@ static int ashmem_mmap(struct file *file, struct vm_area_struct *vma)
+ 	}
+ 	get_file(asma->file);
+ 
+-	/*
+-	 * XXX - Reworked to use shmem_zero_setup() instead of
+-	 * shmem_set_file while we're in staging. -jstultz
+-	 */
+-	if (vma->vm_flags & VM_SHARED) {
+-		ret = shmem_zero_setup(vma);
+-		if (ret) {
+-			fput(asma->file);
+-			goto out;
+-		}
++	if (vma->vm_flags & VM_SHARED)
++		shmem_set_file(vma, asma->file);
++	else {
++		if (vma->vm_file)
++			fput(vma->vm_file);
++		vma->vm_file = asma->file;
+ 	}
+-
+-	if (vma->vm_file)
+-		fput(vma->vm_file);
+-	vma->vm_file = asma->file;
+ 	vma->vm_flags |= VM_CAN_NONLINEAR;
+ 
+ out:
+diff --git a/drivers/staging/android/binder.c b/drivers/staging/android/binder.c
+index 223639a..a7a5f2a 100644
+--- a/drivers/staging/android/binder.c
++++ b/drivers/staging/android/binder.c
+@@ -33,10 +33,12 @@
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
+ #include <linux/slab.h>
++#include <linux/security.h>
+ 
+ #include "binder.h"
++#include "binder_trace.h"
+ 
+-static DEFINE_MUTEX(binder_lock);
++static DEFINE_MUTEX(binder_main_lock);
+ static DEFINE_MUTEX(binder_deferred_lock);
+ static DEFINE_MUTEX(binder_mmap_lock);
+ 
+@@ -499,6 +501,19 @@ out_unlock:
+ 	return -EBADF;
+ }
+ 
++static inline void binder_lock(const char *tag)
++{
++	trace_binder_lock(tag);
++	mutex_lock(&binder_main_lock);
++	trace_binder_locked(tag);
++}
++
++static inline void binder_unlock(const char *tag)
++{
++	trace_binder_unlock(tag);
++	mutex_unlock(&binder_main_lock);
++}
++
+ static void binder_set_nice(long nice)
+ {
+ 	long min_nice;
+@@ -625,6 +640,8 @@ static int binder_update_page_range(struct binder_proc *proc, int allocate,
+ 	if (end <= start)
+ 		return 0;
+ 
++	trace_binder_update_page_range(proc, allocate, start, end);
++
+ 	if (vma)
+ 		mm = NULL;
+ 	else
+@@ -1473,6 +1490,10 @@ static void binder_transaction(struct binder_proc *proc,
+ 			return_error = BR_DEAD_REPLY;
+ 			goto err_dead_binder;
+ 		}
++		if (security_binder_transaction(proc->tsk, target_proc->tsk) < 0) {
++			return_error = BR_FAILED_REPLY;
++			goto err_invalid_target_handle;
++		}
+ 		if (!(tr->flags & TF_ONE_WAY) && thread->transaction_stack) {
+ 			struct binder_transaction *tmp;
+ 			tmp = thread->transaction_stack;
+@@ -1549,6 +1570,9 @@ static void binder_transaction(struct binder_proc *proc,
+ 	t->code = tr->code;
+ 	t->flags = tr->flags;
+ 	t->priority = task_nice(current);
++
++	trace_binder_transaction(reply, t, target_node);
++
+ 	t->buffer = binder_alloc_buf(target_proc, tr->data_size,
+ 		tr->offsets_size, !reply && (t->flags & TF_ONE_WAY));
+ 	if (t->buffer == NULL) {
+@@ -1559,6 +1583,7 @@ static void binder_transaction(struct binder_proc *proc,
+ 	t->buffer->debug_id = t->debug_id;
+ 	t->buffer->transaction = t;
+ 	t->buffer->target_node = target_node;
++	trace_binder_transaction_alloc_buf(t->buffer);
+ 	if (target_node)
+ 		binder_inc_node(target_node, 1, 0, NULL);
+ 
+@@ -1618,6 +1643,10 @@ static void binder_transaction(struct binder_proc *proc,
+ 					fp->cookie, node->cookie);
+ 				goto err_binder_get_ref_for_node_failed;
+ 			}
++			if (security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
++				return_error = BR_FAILED_REPLY;
++				goto err_binder_get_ref_for_node_failed;
++			}
+ 			ref = binder_get_ref_for_node(target_proc, node);
+ 			if (ref == NULL) {
+ 				return_error = BR_FAILED_REPLY;
+@@ -1631,6 +1660,7 @@ static void binder_transaction(struct binder_proc *proc,
+ 			binder_inc_ref(ref, fp->type == BINDER_TYPE_HANDLE,
+ 				       &thread->todo);
+ 
++			trace_binder_transaction_node_to_ref(t, node, ref);
+ 			binder_debug(BINDER_DEBUG_TRANSACTION,
+ 				     "        node %d u%p -> ref %d desc %d\n",
+ 				     node->debug_id, node->ptr, ref->debug_id,
+@@ -1647,6 +1677,10 @@ static void binder_transaction(struct binder_proc *proc,
+ 				return_error = BR_FAILED_REPLY;
+ 				goto err_binder_get_ref_failed;
+ 			}
++			if (security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
++				return_error = BR_FAILED_REPLY;
++				goto err_binder_get_ref_failed;
++			}
+ 			if (ref->node->proc == target_proc) {
+ 				if (fp->type == BINDER_TYPE_HANDLE)
+ 					fp->type = BINDER_TYPE_BINDER;
+@@ -1655,6 +1689,7 @@ static void binder_transaction(struct binder_proc *proc,
+ 				fp->binder = ref->node->ptr;
+ 				fp->cookie = ref->node->cookie;
+ 				binder_inc_node(ref->node, fp->type == BINDER_TYPE_BINDER, 0, NULL);
++				trace_binder_transaction_ref_to_node(t, ref);
+ 				binder_debug(BINDER_DEBUG_TRANSACTION,
+ 					     "        ref %d desc %d -> node %d u%p\n",
+ 					     ref->debug_id, ref->desc, ref->node->debug_id,
+@@ -1668,6 +1703,8 @@ static void binder_transaction(struct binder_proc *proc,
+ 				}
+ 				fp->handle = new_ref->desc;
+ 				binder_inc_ref(new_ref, fp->type == BINDER_TYPE_HANDLE, NULL);
++				trace_binder_transaction_ref_to_ref(t, ref,
++								    new_ref);
+ 				binder_debug(BINDER_DEBUG_TRANSACTION,
+ 					     "        ref %d desc %d -> ref %d desc %d (node %d)\n",
+ 					     ref->debug_id, ref->desc, new_ref->debug_id,
+@@ -1700,6 +1737,11 @@ static void binder_transaction(struct binder_proc *proc,
+ 				return_error = BR_FAILED_REPLY;
+ 				goto err_fget_failed;
+ 			}
++			if (security_binder_transfer_file(proc->tsk, target_proc->tsk, file) < 0) {
++				fput(file);
++				return_error = BR_FAILED_REPLY;
++				goto err_get_unused_fd_failed;
++			}
+ 			target_fd = task_get_unused_fd_flags(target_proc, O_CLOEXEC);
+ 			if (target_fd < 0) {
+ 				fput(file);
+@@ -1707,6 +1749,7 @@ static void binder_transaction(struct binder_proc *proc,
+ 				goto err_get_unused_fd_failed;
+ 			}
+ 			task_fd_install(target_proc, target_fd, file);
++			trace_binder_transaction_fd(t, fp->handle, target_fd);
+ 			binder_debug(BINDER_DEBUG_TRANSACTION,
+ 				     "        fd %ld -> %d\n", fp->handle, target_fd);
+ 			/* TODO: fput? */
+@@ -1755,6 +1798,7 @@ err_binder_new_node_failed:
+ err_bad_object_type:
+ err_bad_offset:
+ err_copy_data_failed:
++	trace_binder_transaction_failed_buffer_release(t->buffer);
+ 	binder_transaction_buffer_release(target_proc, t->buffer, offp);
+ 	t->buffer->transaction = NULL;
+ 	binder_free_buf(target_proc, t->buffer);
+@@ -1800,6 +1844,7 @@ int binder_thread_write(struct binder_proc *proc, struct binder_thread *thread,
+ 		if (get_user(cmd, (uint32_t __user *)ptr))
+ 			return -EFAULT;
+ 		ptr += sizeof(uint32_t);
++		trace_binder_command(cmd);
+ 		if (_IOC_NR(cmd) < ARRAY_SIZE(binder_stats.bc)) {
+ 			binder_stats.bc[_IOC_NR(cmd)]++;
+ 			proc->stats.bc[_IOC_NR(cmd)]++;
+@@ -1969,6 +2014,7 @@ int binder_thread_write(struct binder_proc *proc, struct binder_thread *thread,
+ 				else
+ 					list_move_tail(buffer->target_node->async_todo.next, &thread->todo);
+ 			}
++			trace_binder_transaction_buffer_release(buffer);
+ 			binder_transaction_buffer_release(proc, buffer, NULL);
+ 			binder_free_buf(proc, buffer);
+ 			break;
+@@ -2177,6 +2223,7 @@ int binder_thread_write(struct binder_proc *proc, struct binder_thread *thread,
+ void binder_stat_br(struct binder_proc *proc, struct binder_thread *thread,
+ 		    uint32_t cmd)
+ {
++	trace_binder_return(cmd);
+ 	if (_IOC_NR(cmd) < ARRAY_SIZE(binder_stats.br)) {
+ 		binder_stats.br[_IOC_NR(cmd)]++;
+ 		proc->stats.br[_IOC_NR(cmd)]++;
+@@ -2223,6 +2270,7 @@ retry:
+ 			if (put_user(thread->return_error2, (uint32_t __user *)ptr))
+ 				return -EFAULT;
+ 			ptr += sizeof(uint32_t);
++			binder_stat_br(proc, thread, thread->return_error2);
+ 			if (ptr == end)
+ 				goto done;
+ 			thread->return_error2 = BR_OK;
+@@ -2230,6 +2278,7 @@ retry:
+ 		if (put_user(thread->return_error, (uint32_t __user *)ptr))
+ 			return -EFAULT;
+ 		ptr += sizeof(uint32_t);
++		binder_stat_br(proc, thread, thread->return_error);
+ 		thread->return_error = BR_OK;
+ 		goto done;
+ 	}
+@@ -2238,7 +2287,12 @@ retry:
+ 	thread->looper |= BINDER_LOOPER_STATE_WAITING;
+ 	if (wait_for_proc_work)
+ 		proc->ready_threads++;
+-	mutex_unlock(&binder_lock);
++
++	binder_unlock(__func__);
++
++	trace_binder_wait_for_work(wait_for_proc_work,
++				   !!thread->transaction_stack,
++				   !list_empty(&thread->todo));
+ 	if (wait_for_proc_work) {
+ 		if (!(thread->looper & (BINDER_LOOPER_STATE_REGISTERED |
+ 					BINDER_LOOPER_STATE_ENTERED))) {
+@@ -2262,7 +2316,9 @@ retry:
+ 		} else
+ 			ret = wait_event_interruptible(thread->wait, binder_has_thread_work(thread));
+ 	}
+-	mutex_lock(&binder_lock);
++
++	binder_lock(__func__);
++
+ 	if (wait_for_proc_work)
+ 		proc->ready_threads--;
+ 	thread->looper &= ~BINDER_LOOPER_STATE_WAITING;
+@@ -2385,6 +2441,7 @@ retry:
+ 			if (put_user(death->cookie, (void * __user *)ptr))
+ 				return -EFAULT;
+ 			ptr += sizeof(void *);
++			binder_stat_br(proc, thread, cmd);
+ 			binder_debug(BINDER_DEBUG_DEATH_NOTIFICATION,
+ 				     "binder: %d:%d %s %p\n",
+ 				      proc->pid, thread->pid,
+@@ -2452,6 +2509,7 @@ retry:
+ 			return -EFAULT;
+ 		ptr += sizeof(tr);
+ 
++		trace_binder_transaction_received(t);
+ 		binder_stat_br(proc, thread, cmd);
+ 		binder_debug(BINDER_DEBUG_TRANSACTION,
+ 			     "binder: %d:%d %s %d %d:%d, cmd %d"
+@@ -2492,6 +2550,7 @@ done:
+ 			     proc->pid, thread->pid);
+ 		if (put_user(BR_SPAWN_LOOPER, (uint32_t __user *)buffer))
+ 			return -EFAULT;
++		binder_stat_br(proc, thread, BR_SPAWN_LOOPER);
+ 	}
+ 	return 0;
+ }
+@@ -2628,12 +2687,14 @@ static unsigned int binder_poll(struct file *filp,
+ 	struct binder_thread *thread = NULL;
+ 	int wait_for_proc_work;
+ 
+-	mutex_lock(&binder_lock);
++	binder_lock(__func__);
++
+ 	thread = binder_get_thread(proc);
+ 
+ 	wait_for_proc_work = thread->transaction_stack == NULL &&
+ 		list_empty(&thread->todo) && thread->return_error == BR_OK;
+-	mutex_unlock(&binder_lock);
++
++	binder_unlock(__func__);
+ 
+ 	if (wait_for_proc_work) {
+ 		if (binder_has_proc_work(proc, thread))
+@@ -2661,11 +2722,13 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 
+ 	/*printk(KERN_INFO "binder_ioctl: %d:%d %x %lx\n", proc->pid, current->pid, cmd, arg);*/
+ 
++	trace_binder_ioctl(cmd, arg);
++
+ 	ret = wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
+ 	if (ret)
+-		return ret;
++		goto err_unlocked;
+ 
+-	mutex_lock(&binder_lock);
++	binder_lock(__func__);
+ 	thread = binder_get_thread(proc);
+ 	if (thread == NULL) {
+ 		ret = -ENOMEM;
+@@ -2690,6 +2753,7 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 
+ 		if (bwr.write_size > 0) {
+ 			ret = binder_thread_write(proc, thread, (void __user *)bwr.write_buffer, bwr.write_size, &bwr.write_consumed);
++			trace_binder_write_done(ret);
+ 			if (ret < 0) {
+ 				bwr.read_consumed = 0;
+ 				if (copy_to_user(ubuf, &bwr, sizeof(bwr)))
+@@ -2699,6 +2763,7 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		}
+ 		if (bwr.read_size > 0) {
+ 			ret = binder_thread_read(proc, thread, (void __user *)bwr.read_buffer, bwr.read_size, &bwr.read_consumed, filp->f_flags & O_NONBLOCK);
++			trace_binder_read_done(ret);
+ 			if (!list_empty(&proc->todo))
+ 				wake_up_interruptible(&proc->wait);
+ 			if (ret < 0) {
+@@ -2729,6 +2794,9 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 			ret = -EBUSY;
+ 			goto err;
+ 		}
++		ret = security_binder_set_context_mgr(proc->tsk);
++		if (ret < 0)
++			goto err;
+ 		if (binder_context_mgr_uid != -1) {
+ 			if (binder_context_mgr_uid != current->cred->euid) {
+ 				printk(KERN_ERR "binder: BINDER_SET_"
+@@ -2774,10 +2842,12 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ err:
+ 	if (thread)
+ 		thread->looper &= ~BINDER_LOOPER_STATE_NEED_RETURN;
+-	mutex_unlock(&binder_lock);
++	binder_unlock(__func__);
+ 	wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
+ 	if (ret && ret != -ERESTARTSYS)
+ 		printk(KERN_INFO "binder: %d:%d ioctl %x %lx returned %d\n", proc->pid, current->pid, cmd, arg, ret);
++err_unlocked:
++	trace_binder_ioctl_done(ret);
+ 	return ret;
+ }
+ 
+@@ -2920,13 +2990,16 @@ static int binder_open(struct inode *nodp, struct file *filp)
+ 	INIT_LIST_HEAD(&proc->todo);
+ 	init_waitqueue_head(&proc->wait);
+ 	proc->default_priority = task_nice(current);
+-	mutex_lock(&binder_lock);
++
++	binder_lock(__func__);
++
+ 	binder_stats_created(BINDER_STAT_PROC);
+ 	hlist_add_head(&proc->proc_node, &binder_procs);
+ 	proc->pid = current->group_leader->pid;
+ 	INIT_LIST_HEAD(&proc->delivered_death);
+ 	filp->private_data = proc;
+-	mutex_unlock(&binder_lock);
++
++	binder_unlock(__func__);
+ 
+ 	if (binder_debugfs_dir_entry_proc) {
+ 		char strbuf[11];
+@@ -3108,7 +3181,7 @@ static void binder_deferred_func(struct work_struct *work)
+ 
+ 	int defer;
+ 	do {
+-		mutex_lock(&binder_lock);
++		binder_lock(__func__);
+ 		mutex_lock(&binder_deferred_lock);
+ 		if (!hlist_empty(&binder_deferred_list)) {
+ 			proc = hlist_entry(binder_deferred_list.first,
+@@ -3135,7 +3208,7 @@ static void binder_deferred_func(struct work_struct *work)
+ 		if (defer & BINDER_DEFERRED_RELEASE)
+ 			binder_deferred_release(proc); /* frees proc */
+ 
+-		mutex_unlock(&binder_lock);
++		binder_unlock(__func__);
+ 		if (files)
+ 			put_files_struct(files);
+ 	} while (proc);
+@@ -3476,7 +3549,7 @@ static int binder_state_show(struct seq_file *m, void *unused)
+ 	int do_lock = !binder_debug_no_lock;
+ 
+ 	if (do_lock)
+-		mutex_lock(&binder_lock);
++		binder_lock(__func__);
+ 
+ 	seq_puts(m, "binder state:\n");
+ 
+@@ -3488,7 +3561,7 @@ static int binder_state_show(struct seq_file *m, void *unused)
+ 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node)
+ 		print_binder_proc(m, proc, 1);
+ 	if (do_lock)
+-		mutex_unlock(&binder_lock);
++		binder_unlock(__func__);
+ 	return 0;
+ }
+ 
+@@ -3499,7 +3572,7 @@ static int binder_stats_show(struct seq_file *m, void *unused)
+ 	int do_lock = !binder_debug_no_lock;
+ 
+ 	if (do_lock)
+-		mutex_lock(&binder_lock);
++		binder_lock(__func__);
+ 
+ 	seq_puts(m, "binder stats:\n");
+ 
+@@ -3508,7 +3581,7 @@ static int binder_stats_show(struct seq_file *m, void *unused)
+ 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node)
+ 		print_binder_proc_stats(m, proc);
+ 	if (do_lock)
+-		mutex_unlock(&binder_lock);
++		binder_unlock(__func__);
+ 	return 0;
+ }
+ 
+@@ -3519,13 +3592,13 @@ static int binder_transactions_show(struct seq_file *m, void *unused)
+ 	int do_lock = !binder_debug_no_lock;
+ 
+ 	if (do_lock)
+-		mutex_lock(&binder_lock);
++		binder_lock(__func__);
+ 
+ 	seq_puts(m, "binder transactions:\n");
+ 	hlist_for_each_entry(proc, pos, &binder_procs, proc_node)
+ 		print_binder_proc(m, proc, 0);
+ 	if (do_lock)
+-		mutex_unlock(&binder_lock);
++		binder_unlock(__func__);
+ 	return 0;
+ }
+ 
+@@ -3535,11 +3608,11 @@ static int binder_proc_show(struct seq_file *m, void *unused)
+ 	int do_lock = !binder_debug_no_lock;
+ 
+ 	if (do_lock)
+-		mutex_lock(&binder_lock);
++		binder_lock(__func__);
+ 	seq_puts(m, "binder proc state:\n");
+ 	print_binder_proc(m, proc, 1);
+ 	if (do_lock)
+-		mutex_unlock(&binder_lock);
++		binder_unlock(__func__);
+ 	return 0;
+ }
+ 
+@@ -3634,4 +3707,7 @@ static int __init binder_init(void)
+ 
+ device_initcall(binder_init);
+ 
++#define CREATE_TRACE_POINTS
++#include "binder_trace.h"
++
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/staging/android/binder_trace.h b/drivers/staging/android/binder_trace.h
+new file mode 100644
+index 0000000..82a567c
+--- /dev/null
++++ b/drivers/staging/android/binder_trace.h
+@@ -0,0 +1,327 @@
++/*
++ * Copyright (C) 2012 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM binder
++
++#if !defined(_BINDER_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _BINDER_TRACE_H
++
++#include <linux/tracepoint.h>
++
++struct binder_buffer;
++struct binder_node;
++struct binder_proc;
++struct binder_ref;
++struct binder_thread;
++struct binder_transaction;
++
++TRACE_EVENT(binder_ioctl,
++	TP_PROTO(unsigned int cmd, unsigned long arg),
++	TP_ARGS(cmd, arg),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, cmd)
++		__field(unsigned long, arg)
++	),
++	TP_fast_assign(
++		__entry->cmd = cmd;
++		__entry->arg = arg;
++	),
++	TP_printk("cmd=0x%x arg=0x%lx", __entry->cmd, __entry->arg)
++);
++
++DECLARE_EVENT_CLASS(binder_lock_class,
++	TP_PROTO(const char *tag),
++	TP_ARGS(tag),
++	TP_STRUCT__entry(
++		__field(const char *, tag)
++	),
++	TP_fast_assign(
++		__entry->tag = tag;
++	),
++	TP_printk("tag=%s", __entry->tag)
++);
++
++#define DEFINE_BINDER_LOCK_EVENT(name)	\
++DEFINE_EVENT(binder_lock_class, name,	\
++	TP_PROTO(const char *func), \
++	TP_ARGS(func))
++
++DEFINE_BINDER_LOCK_EVENT(binder_lock);
++DEFINE_BINDER_LOCK_EVENT(binder_locked);
++DEFINE_BINDER_LOCK_EVENT(binder_unlock);
++
++DECLARE_EVENT_CLASS(binder_function_return_class,
++	TP_PROTO(int ret),
++	TP_ARGS(ret),
++	TP_STRUCT__entry(
++		__field(int, ret)
++	),
++	TP_fast_assign(
++		__entry->ret = ret;
++	),
++	TP_printk("ret=%d", __entry->ret)
++);
++
++#define DEFINE_BINDER_FUNCTION_RETURN_EVENT(name)	\
++DEFINE_EVENT(binder_function_return_class, name,	\
++	TP_PROTO(int ret), \
++	TP_ARGS(ret))
++
++DEFINE_BINDER_FUNCTION_RETURN_EVENT(binder_ioctl_done);
++DEFINE_BINDER_FUNCTION_RETURN_EVENT(binder_write_done);
++DEFINE_BINDER_FUNCTION_RETURN_EVENT(binder_read_done);
++
++TRACE_EVENT(binder_wait_for_work,
++	TP_PROTO(bool proc_work, bool transaction_stack, bool thread_todo),
++	TP_ARGS(proc_work, transaction_stack, thread_todo),
++
++	TP_STRUCT__entry(
++		__field(bool, proc_work)
++		__field(bool, transaction_stack)
++		__field(bool, thread_todo)
++	),
++	TP_fast_assign(
++		__entry->proc_work = proc_work;
++		__entry->transaction_stack = transaction_stack;
++		__entry->thread_todo = thread_todo;
++	),
++	TP_printk("proc_work=%d transaction_stack=%d thread_todo=%d",
++		  __entry->proc_work, __entry->transaction_stack,
++		  __entry->thread_todo)
++);
++
++TRACE_EVENT(binder_transaction,
++	TP_PROTO(bool reply, struct binder_transaction *t,
++		 struct binder_node *target_node),
++	TP_ARGS(reply, t, target_node),
++	TP_STRUCT__entry(
++		__field(int, debug_id)
++		__field(int, target_node)
++		__field(int, to_proc)
++		__field(int, to_thread)
++		__field(int, reply)
++		__field(unsigned int, code)
++		__field(unsigned int, flags)
++	),
++	TP_fast_assign(
++		__entry->debug_id = t->debug_id;
++		__entry->target_node = target_node ? target_node->debug_id : 0;
++		__entry->to_proc = t->to_proc->pid;
++		__entry->to_thread = t->to_thread ? t->to_thread->pid : 0;
++		__entry->reply = reply;
++		__entry->code = t->code;
++		__entry->flags = t->flags;
++	),
++	TP_printk("transaction=%d dest_node=%d dest_proc=%d dest_thread=%d reply=%d flags=0x%x code=0x%x",
++		  __entry->debug_id, __entry->target_node,
++		  __entry->to_proc, __entry->to_thread,
++		  __entry->reply, __entry->flags, __entry->code)
++);
++
++TRACE_EVENT(binder_transaction_received,
++	TP_PROTO(struct binder_transaction *t),
++	TP_ARGS(t),
++
++	TP_STRUCT__entry(
++		__field(int, debug_id)
++	),
++	TP_fast_assign(
++		__entry->debug_id = t->debug_id;
++	),
++	TP_printk("transaction=%d", __entry->debug_id)
++);
++
++TRACE_EVENT(binder_transaction_node_to_ref,
++	TP_PROTO(struct binder_transaction *t, struct binder_node *node,
++		 struct binder_ref *ref),
++	TP_ARGS(t, node, ref),
++
++	TP_STRUCT__entry(
++		__field(int, debug_id)
++		__field(int, node_debug_id)
++		__field(void __user *, node_ptr)
++		__field(int, ref_debug_id)
++		__field(uint32_t, ref_desc)
++	),
++	TP_fast_assign(
++		__entry->debug_id = t->debug_id;
++		__entry->node_debug_id = node->debug_id;
++		__entry->node_ptr = node->ptr;
++		__entry->ref_debug_id = ref->debug_id;
++		__entry->ref_desc = ref->desc;
++	),
++	TP_printk("transaction=%d node=%d src_ptr=0x%p ==> dest_ref=%d dest_desc=%d",
++		  __entry->debug_id, __entry->node_debug_id, __entry->node_ptr,
++		  __entry->ref_debug_id, __entry->ref_desc)
++);
++
++TRACE_EVENT(binder_transaction_ref_to_node,
++	TP_PROTO(struct binder_transaction *t, struct binder_ref *ref),
++	TP_ARGS(t, ref),
++
++	TP_STRUCT__entry(
++		__field(int, debug_id)
++		__field(int, ref_debug_id)
++		__field(uint32_t, ref_desc)
++		__field(int, node_debug_id)
++		__field(void __user *, node_ptr)
++	),
++	TP_fast_assign(
++		__entry->debug_id = t->debug_id;
++		__entry->ref_debug_id = ref->debug_id;
++		__entry->ref_desc = ref->desc;
++		__entry->node_debug_id = ref->node->debug_id;
++		__entry->node_ptr = ref->node->ptr;
++	),
++	TP_printk("transaction=%d node=%d src_ref=%d src_desc=%d ==> dest_ptr=0x%p",
++		  __entry->debug_id, __entry->node_debug_id,
++		  __entry->ref_debug_id, __entry->ref_desc, __entry->node_ptr)
++);
++
++TRACE_EVENT(binder_transaction_ref_to_ref,
++	TP_PROTO(struct binder_transaction *t, struct binder_ref *src_ref,
++		 struct binder_ref *dest_ref),
++	TP_ARGS(t, src_ref, dest_ref),
++
++	TP_STRUCT__entry(
++		__field(int, debug_id)
++		__field(int, node_debug_id)
++		__field(int, src_ref_debug_id)
++		__field(uint32_t, src_ref_desc)
++		__field(int, dest_ref_debug_id)
++		__field(uint32_t, dest_ref_desc)
++	),
++	TP_fast_assign(
++		__entry->debug_id = t->debug_id;
++		__entry->node_debug_id = src_ref->node->debug_id;
++		__entry->src_ref_debug_id = src_ref->debug_id;
++		__entry->src_ref_desc = src_ref->desc;
++		__entry->dest_ref_debug_id = dest_ref->debug_id;
++		__entry->dest_ref_desc = dest_ref->desc;
++	),
++	TP_printk("transaction=%d node=%d src_ref=%d src_desc=%d ==> dest_ref=%d dest_desc=%d",
++		  __entry->debug_id, __entry->node_debug_id,
++		  __entry->src_ref_debug_id, __entry->src_ref_desc,
++		  __entry->dest_ref_debug_id, __entry->dest_ref_desc)
++);
++
++TRACE_EVENT(binder_transaction_fd,
++	TP_PROTO(struct binder_transaction *t, int src_fd, int dest_fd),
++	TP_ARGS(t, src_fd, dest_fd),
++
++	TP_STRUCT__entry(
++		__field(int, debug_id)
++		__field(int, src_fd)
++		__field(int, dest_fd)
++	),
++	TP_fast_assign(
++		__entry->debug_id = t->debug_id;
++		__entry->src_fd = src_fd;
++		__entry->dest_fd = dest_fd;
++	),
++	TP_printk("transaction=%d src_fd=%d ==> dest_fd=%d",
++		  __entry->debug_id, __entry->src_fd, __entry->dest_fd)
++);
++
++DECLARE_EVENT_CLASS(binder_buffer_class,
++	TP_PROTO(struct binder_buffer *buf),
++	TP_ARGS(buf),
++	TP_STRUCT__entry(
++		__field(int, debug_id)
++		__field(size_t, data_size)
++		__field(size_t, offsets_size)
++	),
++	TP_fast_assign(
++		__entry->debug_id = buf->debug_id;
++		__entry->data_size = buf->data_size;
++		__entry->offsets_size = buf->offsets_size;
++	),
++	TP_printk("transaction=%d data_size=%zd offsets_size=%zd",
++		  __entry->debug_id, __entry->data_size, __entry->offsets_size)
++);
++
++DEFINE_EVENT(binder_buffer_class, binder_transaction_alloc_buf,
++	TP_PROTO(struct binder_buffer *buffer),
++	TP_ARGS(buffer));
++
++DEFINE_EVENT(binder_buffer_class, binder_transaction_buffer_release,
++	TP_PROTO(struct binder_buffer *buffer),
++	TP_ARGS(buffer));
++
++DEFINE_EVENT(binder_buffer_class, binder_transaction_failed_buffer_release,
++	TP_PROTO(struct binder_buffer *buffer),
++	TP_ARGS(buffer));
++
++TRACE_EVENT(binder_update_page_range,
++	TP_PROTO(struct binder_proc *proc, bool allocate,
++		 void *start, void *end),
++	TP_ARGS(proc, allocate, start, end),
++	TP_STRUCT__entry(
++		__field(int, proc)
++		__field(bool, allocate)
++		__field(size_t, offset)
++		__field(size_t, size)
++	),
++	TP_fast_assign(
++		__entry->proc = proc->pid;
++		__entry->allocate = allocate;
++		__entry->offset = start - proc->buffer;
++		__entry->size = end - start;
++	),
++	TP_printk("proc=%d allocate=%d offset=%zu size=%zu",
++		  __entry->proc, __entry->allocate,
++		  __entry->offset, __entry->size)
++);
++
++TRACE_EVENT(binder_command,
++	TP_PROTO(uint32_t cmd),
++	TP_ARGS(cmd),
++	TP_STRUCT__entry(
++		__field(uint32_t, cmd)
++	),
++	TP_fast_assign(
++		__entry->cmd = cmd;
++	),
++	TP_printk("cmd=0x%x %s",
++		  __entry->cmd,
++		  _IOC_NR(__entry->cmd) < ARRAY_SIZE(binder_command_strings) ?
++			  binder_command_strings[_IOC_NR(__entry->cmd)] :
++			  "unknown")
++);
++
++TRACE_EVENT(binder_return,
++	TP_PROTO(uint32_t cmd),
++	TP_ARGS(cmd),
++	TP_STRUCT__entry(
++		__field(uint32_t, cmd)
++	),
++	TP_fast_assign(
++		__entry->cmd = cmd;
++	),
++	TP_printk("cmd=0x%x %s",
++		  __entry->cmd,
++		  _IOC_NR(__entry->cmd) < ARRAY_SIZE(binder_return_strings) ?
++			  binder_return_strings[_IOC_NR(__entry->cmd)] :
++			  "unknown")
++);
++
++#endif /* _BINDER_TRACE_H */
++
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_PATH .
++#define TRACE_INCLUDE_FILE binder_trace
++#include <trace/define_trace.h>
+diff --git a/drivers/staging/android/logger.c b/drivers/staging/android/logger.c
+index ea69b6a..3813c74 100644
+--- a/drivers/staging/android/logger.c
++++ b/drivers/staging/android/logger.c
+@@ -57,6 +57,8 @@ struct logger_reader {
+ 	struct logger_log	*log;	/* associated log */
+ 	struct list_head	list;	/* entry in logger_log's list */
+ 	size_t			r_off;	/* current read head offset */
++	bool			r_all;	/* reader can read all entries */
++	int			r_ver;	/* reader ABI version */
+ };
+ 
+ /* logger_offset - returns index 'n' into the log via (optimized) modulus */
+@@ -90,8 +92,29 @@ static inline struct logger_log *file_get_log(struct file *file)
+ }
+ 
+ /*
+- * get_entry_len - Grabs the length of the payload of the next entry starting
+- * from 'off'.
++ * get_entry_header - returns a pointer to the logger_entry header within
++ * 'log' starting at offset 'off'. A temporary logger_entry 'scratch' must
++ * be provided. Typically the return value will be a pointer within
++ * 'logger->buf'.  However, a pointer to 'scratch' may be returned if
++ * the log entry spans the end and beginning of the circular buffer.
++ */
++static struct logger_entry *get_entry_header(struct logger_log *log,
++		size_t off, struct logger_entry *scratch)
++{
++	size_t len = min(sizeof(struct logger_entry), log->size - off);
++	if (len != sizeof(struct logger_entry)) {
++		memcpy(((void *) scratch), log->buffer + off, len);
++		memcpy(((void *) scratch) + len, log->buffer,
++			sizeof(struct logger_entry) - len);
++		return scratch;
++	}
++
++	return (struct logger_entry *) (log->buffer + off);
++}
++
++/*
++ * get_entry_msg_len - Grabs the length of the message of the entry
++ * starting from from 'off'.
+  *
+  * An entry length is 2 bytes (16 bits) in host endian order.
+  * In the log, the length does not include the size of the log entry structure.
+@@ -99,20 +122,45 @@ static inline struct logger_log *file_get_log(struct file *file)
+  *
+  * Caller needs to hold log->mutex.
+  */
+-static __u32 get_entry_len(struct logger_log *log, size_t off)
++static __u32 get_entry_msg_len(struct logger_log *log, size_t off)
+ {
+-	__u16 val;
++	struct logger_entry scratch;
++	struct logger_entry *entry;
+ 
+-	/* copy 2 bytes from buffer, in memcpy order, */
+-	/* handling possible wrap at end of buffer */
++	entry = get_entry_header(log, off, &scratch);
++	return entry->len;
++}
+ 
+-	((__u8 *)&val)[0] = log->buffer[off];
+-	if (likely(off+1 < log->size))
+-		((__u8 *)&val)[1] = log->buffer[off+1];
++static size_t get_user_hdr_len(int ver)
++{
++	if (ver < 2)
++		return sizeof(struct user_logger_entry_compat);
+ 	else
+-		((__u8 *)&val)[1] = log->buffer[0];
++		return sizeof(struct logger_entry);
++}
+ 
+-	return sizeof(struct logger_entry) + val;
++static ssize_t copy_header_to_user(int ver, struct logger_entry *entry,
++					 char __user *buf)
++{
++	void *hdr;
++	size_t hdr_len;
++	struct user_logger_entry_compat v1;
++
++	if (ver < 2) {
++		v1.len      = entry->len;
++		v1.__pad    = 0;
++		v1.pid      = entry->pid;
++		v1.tid      = entry->tid;
++		v1.sec      = entry->sec;
++		v1.nsec     = entry->nsec;
++		hdr         = &v1;
++		hdr_len     = sizeof(struct user_logger_entry_compat);
++	} else {
++		hdr         = entry;
++		hdr_len     = sizeof(struct logger_entry);
++	}
++
++	return copy_to_user(buf, hdr, hdr_len);
+ }
+ 
+ /*
+@@ -126,15 +174,31 @@ static ssize_t do_read_log_to_user(struct logger_log *log,
+ 				   char __user *buf,
+ 				   size_t count)
+ {
++	struct logger_entry scratch;
++	struct logger_entry *entry;
+ 	size_t len;
++	size_t msg_start;
+ 
+ 	/*
+-	 * We read from the log in two disjoint operations. First, we read from
+-	 * the current read head offset up to 'count' bytes or to the end of
++	 * First, copy the header to userspace, using the version of
++	 * the header requested
++	 */
++	entry = get_entry_header(log, reader->r_off, &scratch);
++	if (copy_header_to_user(reader->r_ver, entry, buf))
++		return -EFAULT;
++
++	count -= get_user_hdr_len(reader->r_ver);
++	buf += get_user_hdr_len(reader->r_ver);
++	msg_start = logger_offset(log,
++		reader->r_off + sizeof(struct logger_entry));
++
++	/*
++	 * We read from the msg in two disjoint operations. First, we read from
++	 * the current msg head offset up to 'count' bytes or to the end of
+ 	 * the log, whichever comes first.
+ 	 */
+-	len = min(count, log->size - reader->r_off);
+-	if (copy_to_user(buf, log->buffer + reader->r_off, len))
++	len = min(count, log->size - msg_start);
++	if (copy_to_user(buf, log->buffer + msg_start, len))
+ 		return -EFAULT;
+ 
+ 	/*
+@@ -145,9 +209,34 @@ static ssize_t do_read_log_to_user(struct logger_log *log,
+ 		if (copy_to_user(buf + len, log->buffer, count - len))
+ 			return -EFAULT;
+ 
+-	reader->r_off = logger_offset(log, reader->r_off + count);
++	reader->r_off = logger_offset(log, reader->r_off +
++		sizeof(struct logger_entry) + count);
+ 
+-	return count;
++	return count + get_user_hdr_len(reader->r_ver);
++}
++
++/*
++ * get_next_entry_by_uid - Starting at 'off', returns an offset into
++ * 'log->buffer' which contains the first entry readable by 'euid'
++ */
++static size_t get_next_entry_by_uid(struct logger_log *log,
++		size_t off, uid_t euid)
++{
++	while (off != log->w_off) {
++		struct logger_entry *entry;
++		struct logger_entry scratch;
++		size_t next_len;
++
++		entry = get_entry_header(log, off, &scratch);
++
++		if (entry->euid == euid)
++			return off;
++
++		next_len = sizeof(struct logger_entry) + entry->len;
++		off = logger_offset(log, off + next_len);
++	}
++
++	return off;
+ }
+ 
+ /*
+@@ -159,7 +248,7 @@ static ssize_t do_read_log_to_user(struct logger_log *log,
+  *	- If there are no log entries to read, blocks until log is written to
+  *	- Atomically reads exactly one log entry
+  *
+- * Optimal read size is LOGGER_ENTRY_MAX_LEN. Will set errno to EINVAL if read
++ * Will set errno to EINVAL if read
+  * buffer is insufficient to hold next entry.
+  */
+ static ssize_t logger_read(struct file *file, char __user *buf,
+@@ -200,6 +289,10 @@ start:
+ 
+ 	mutex_lock(&log->mutex);
+ 
++	if (!reader->r_all)
++		reader->r_off = get_next_entry_by_uid(log,
++			reader->r_off, current_euid());
++
+ 	/* is there still something to read or did we race? */
+ 	if (unlikely(log->w_off == reader->r_off)) {
+ 		mutex_unlock(&log->mutex);
+@@ -207,7 +300,8 @@ start:
+ 	}
+ 
+ 	/* get the size of the next entry */
+-	ret = get_entry_len(log, reader->r_off);
++	ret = get_user_hdr_len(reader->r_ver) +
++		get_entry_msg_len(log, reader->r_off);
+ 	if (count < ret) {
+ 		ret = -EINVAL;
+ 		goto out;
+@@ -233,7 +327,8 @@ static size_t get_next_entry(struct logger_log *log, size_t off, size_t len)
+ 	size_t count = 0;
+ 
+ 	do {
+-		size_t nr = get_entry_len(log, off);
++		size_t nr = sizeof(struct logger_entry) +
++			get_entry_msg_len(log, off);
+ 		off = logger_offset(log, off + nr);
+ 		count += nr;
+ 	} while (count < len);
+@@ -363,7 +458,9 @@ ssize_t logger_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ 	header.tid = current->pid;
+ 	header.sec = now.tv_sec;
+ 	header.nsec = now.tv_nsec;
++	header.euid = current_euid();
+ 	header.len = min_t(size_t, iocb->ki_left, LOGGER_ENTRY_MAX_PAYLOAD);
++	header.hdr_size = sizeof(struct logger_entry);
+ 
+ 	/* null writes succeed, return zero */
+ 	if (unlikely(!header.len))
+@@ -436,6 +533,10 @@ static int logger_open(struct inode *inode, struct file *file)
+ 			return -ENOMEM;
+ 
+ 		reader->log = log;
++		reader->r_ver = 1;
++		reader->r_all = in_egroup_p(inode->i_gid) ||
++			capable(CAP_SYSLOG);
++
+ 		INIT_LIST_HEAD(&reader->list);
+ 
+ 		mutex_lock(&log->mutex);
+@@ -495,6 +596,10 @@ static unsigned int logger_poll(struct file *file, poll_table *wait)
+ 	poll_wait(file, &log->wq, wait);
+ 
+ 	mutex_lock(&log->mutex);
++	if (!reader->r_all)
++		reader->r_off = get_next_entry_by_uid(log,
++			reader->r_off, current_euid());
++
+ 	if (log->w_off != reader->r_off)
+ 		ret |= POLLIN | POLLRDNORM;
+ 	mutex_unlock(&log->mutex);
+@@ -502,11 +607,25 @@ static unsigned int logger_poll(struct file *file, poll_table *wait)
+ 	return ret;
+ }
+ 
++static long logger_set_version(struct logger_reader *reader, void __user *arg)
++{
++	int version;
++	if (copy_from_user(&version, arg, sizeof(int)))
++		return -EFAULT;
++
++	if ((version < 1) || (version > 2))
++		return -EINVAL;
++
++	reader->r_ver = version;
++	return 0;
++}
++
+ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+ 	struct logger_log *log = file_get_log(file);
+ 	struct logger_reader *reader;
+-	long ret = -ENOTTY;
++	long ret = -EINVAL;
++	void __user *argp = (void __user *) arg;
+ 
+ 	mutex_lock(&log->mutex);
+ 
+@@ -531,8 +650,14 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 			break;
+ 		}
+ 		reader = file->private_data;
++
++		if (!reader->r_all)
++			reader->r_off = get_next_entry_by_uid(log,
++				reader->r_off, current_euid());
++
+ 		if (log->w_off != reader->r_off)
+-			ret = get_entry_len(log, reader->r_off);
++			ret = get_user_hdr_len(reader->r_ver) +
++				get_entry_msg_len(log, reader->r_off);
+ 		else
+ 			ret = 0;
+ 		break;
+@@ -541,11 +666,32 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 			ret = -EBADF;
+ 			break;
+ 		}
++		if (!(in_egroup_p(file->f_dentry->d_inode->i_gid) ||
++				capable(CAP_SYSLOG))) {
++			ret = -EPERM;
++			break;
++		}
+ 		list_for_each_entry(reader, &log->readers, list)
+ 			reader->r_off = log->w_off;
+ 		log->head = log->w_off;
+ 		ret = 0;
+ 		break;
++	case LOGGER_GET_VERSION:
++		if (!(file->f_mode & FMODE_READ)) {
++			ret = -EBADF;
++			break;
++		}
++		reader = file->private_data;
++		ret = reader->r_ver;
++		break;
++	case LOGGER_SET_VERSION:
++		if (!(file->f_mode & FMODE_READ)) {
++			ret = -EBADF;
++			break;
++		}
++		reader = file->private_data;
++		ret = logger_set_version(reader, argp);
++		break;
+ 	}
+ 
+ 	mutex_unlock(&log->mutex);
+@@ -566,8 +712,8 @@ static const struct file_operations logger_fops = {
+ 
+ /*
+  * Defines a log structure with name 'NAME' and a size of 'SIZE' bytes, which
+- * must be a power of two, greater than LOGGER_ENTRY_MAX_LEN, and less than
+- * LONG_MAX minus LOGGER_ENTRY_MAX_LEN.
++ * must be a power of two, and greater than
++ * (LOGGER_ENTRY_MAX_PAYLOAD + sizeof(struct logger_entry)).
+  */
+ #define DEFINE_LOGGER_DEVICE(VAR, NAME, SIZE) \
+ static unsigned char _buf_ ## VAR[SIZE]; \
+diff --git a/drivers/staging/android/logger.h b/drivers/staging/android/logger.h
+index 2cb06e9..3f612a3b 100644
+--- a/drivers/staging/android/logger.h
++++ b/drivers/staging/android/logger.h
+@@ -20,7 +20,12 @@
+ #include <linux/types.h>
+ #include <linux/ioctl.h>
+ 
+-struct logger_entry {
++/*
++ * The userspace structure for version 1 of the logger_entry ABI.
++ * This structure is returned to userspace unless the caller requests
++ * an upgrade to a newer ABI version.
++ */
++struct user_logger_entry_compat {
+ 	__u16		len;	/* length of the payload */
+ 	__u16		__pad;	/* no matter what, we get 2 bytes of padding */
+ 	__s32		pid;	/* generating process's pid */
+@@ -30,14 +35,28 @@ struct logger_entry {
+ 	char		msg[0];	/* the entry's payload */
+ };
+ 
++/*
++ * The structure for version 2 of the logger_entry ABI.
++ * This structure is returned to userspace if ioctl(LOGGER_SET_VERSION)
++ * is called with version >= 2
++ */
++struct logger_entry {
++	__u16		len;		/* length of the payload */
++	__u16		hdr_size;	/* sizeof(struct logger_entry_v2) */
++	__s32		pid;		/* generating process's pid */
++	__s32		tid;		/* generating process's tid */
++	__s32		sec;		/* seconds since Epoch */
++	__s32		nsec;		/* nanoseconds */
++	uid_t		euid;		/* effective UID of logger */
++	char		msg[0];		/* the entry's payload */
++};
++
+ #define LOGGER_LOG_RADIO	"log_radio"	/* radio-related messages */
+ #define LOGGER_LOG_EVENTS	"log_events"	/* system/hardware events */
+ #define LOGGER_LOG_SYSTEM	"log_system"	/* system/framework messages */
+ #define LOGGER_LOG_MAIN		"log_main"	/* everything else */
+ 
+-#define LOGGER_ENTRY_MAX_LEN		(4*1024)
+-#define LOGGER_ENTRY_MAX_PAYLOAD	\
+-	(LOGGER_ENTRY_MAX_LEN - sizeof(struct logger_entry))
++#define LOGGER_ENTRY_MAX_PAYLOAD	4076
+ 
+ #define __LOGGERIO	0xAE
+ 
+@@ -45,5 +64,7 @@ struct logger_entry {
+ #define LOGGER_GET_LOG_LEN		_IO(__LOGGERIO, 2) /* used log len */
+ #define LOGGER_GET_NEXT_ENTRY_LEN	_IO(__LOGGERIO, 3) /* next entry len */
+ #define LOGGER_FLUSH_LOG		_IO(__LOGGERIO, 4) /* flush log */
++#define LOGGER_GET_VERSION		_IO(__LOGGERIO, 5) /* abi version */
++#define LOGGER_SET_VERSION		_IO(__LOGGERIO, 6) /* abi version */
+ 
+ #endif /* _LINUX_LOGGER_H */
+diff --git a/drivers/staging/android/lowmemorykiller.c b/drivers/staging/android/lowmemorykiller.c
+index b91e4bc..f6c05c9 100644
+--- a/drivers/staging/android/lowmemorykiller.c
++++ b/drivers/staging/android/lowmemorykiller.c
+@@ -30,16 +30,18 @@
+  *
+  */
+ 
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+ #include <linux/oom.h>
+ #include <linux/sched.h>
++#include <linux/swap.h>
+ #include <linux/rcupdate.h>
+-#include <linux/profile.h>
+ #include <linux/notifier.h>
+ 
+-static uint32_t lowmem_debug_level = 2;
++static uint32_t lowmem_debug_level = 1;
+ static int lowmem_adj[6] = {
+ 	0,
+ 	1,
+@@ -60,7 +62,7 @@ static unsigned long lowmem_deathpending_timeout;
+ #define lowmem_print(level, x...)			\
+ 	do {						\
+ 		if (lowmem_debug_level >= (level))	\
+-			printk(x);			\
++			pr_info(x);			\
+ 	} while (0)
+ 
+ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
+@@ -71,10 +73,11 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
+ 	int tasksize;
+ 	int i;
+ 	int min_score_adj = OOM_SCORE_ADJ_MAX + 1;
++	int minfree = 0;
+ 	int selected_tasksize = 0;
+ 	int selected_oom_score_adj;
+ 	int array_size = ARRAY_SIZE(lowmem_adj);
+-	int other_free = global_page_state(NR_FREE_PAGES);
++	int other_free = global_page_state(NR_FREE_PAGES) - totalreserve_pages;
+ 	int other_file = global_page_state(NR_FILE_PAGES) -
+ 						global_page_state(NR_SHMEM);
+ 
+@@ -83,8 +86,8 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
+ 	if (lowmem_minfree_size < array_size)
+ 		array_size = lowmem_minfree_size;
+ 	for (i = 0; i < array_size; i++) {
+-		if (other_free < lowmem_minfree[i] &&
+-		    other_file < lowmem_minfree[i]) {
++		minfree = lowmem_minfree[i];
++		if (other_free < minfree && other_file < minfree) {
+ 			min_score_adj = lowmem_adj[i];
+ 			break;
+ 		}
+@@ -141,13 +144,22 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
+ 		selected = p;
+ 		selected_tasksize = tasksize;
+ 		selected_oom_score_adj = oom_score_adj;
+-		lowmem_print(2, "select %d (%s), adj %d, size %d, to kill\n",
+-			     p->pid, p->comm, oom_score_adj, tasksize);
++		lowmem_print(2, "select '%s' (%d), adj %d, size %d, to kill\n",
++			     p->comm, p->pid, oom_score_adj, tasksize);
+ 	}
+ 	if (selected) {
+-		lowmem_print(1, "send sigkill to %d (%s), adj %d, size %d\n",
+-			     selected->pid, selected->comm,
+-			     selected_oom_score_adj, selected_tasksize);
++		lowmem_print(1, "Killing '%s' (%d), adj %d,\n" \
++				"   to free %ldkB on behalf of '%s' (%d) because\n" \
++				"   cache %ldkB is below limit %ldkB for oom_score_adj %d\n" \
++				"   Free memory is %ldkB above reserved\n",
++			     selected->comm, selected->pid,
++			     selected_oom_score_adj,
++			     selected_tasksize * (long)(PAGE_SIZE / 1024),
++			     current->comm, current->pid,
++			     other_file * (long)(PAGE_SIZE / 1024),
++			     minfree * (long)(PAGE_SIZE / 1024),
++			     min_score_adj,
++			     other_free * (long)(PAGE_SIZE / 1024));
+ 		lowmem_deathpending_timeout = jiffies + HZ;
+ 		send_sig(SIGKILL, selected, 0);
+ 		set_tsk_thread_flag(selected, TIF_MEMDIE);
+@@ -175,9 +187,94 @@ static void __exit lowmem_exit(void)
+ 	unregister_shrinker(&lowmem_shrinker);
+ }
+ 
++#ifdef CONFIG_ANDROID_LOW_MEMORY_KILLER_AUTODETECT_OOM_ADJ_VALUES
++static int lowmem_oom_adj_to_oom_score_adj(int oom_adj)
++{
++	if (oom_adj == OOM_ADJUST_MAX)
++		return OOM_SCORE_ADJ_MAX;
++	else
++		return (oom_adj * OOM_SCORE_ADJ_MAX) / -OOM_DISABLE;
++}
++
++static void lowmem_autodetect_oom_adj_values(void)
++{
++	int i;
++	int oom_adj;
++	int oom_score_adj;
++	int array_size = ARRAY_SIZE(lowmem_adj);
++
++	if (lowmem_adj_size < array_size)
++		array_size = lowmem_adj_size;
++
++	if (array_size <= 0)
++		return;
++
++	oom_adj = lowmem_adj[array_size - 1];
++	if (oom_adj > OOM_ADJUST_MAX)
++		return;
++
++	oom_score_adj = lowmem_oom_adj_to_oom_score_adj(oom_adj);
++	if (oom_score_adj <= OOM_ADJUST_MAX)
++		return;
++
++	lowmem_print(1, "lowmem_shrink: convert oom_adj to oom_score_adj:\n");
++	for (i = 0; i < array_size; i++) {
++		oom_adj = lowmem_adj[i];
++		oom_score_adj = lowmem_oom_adj_to_oom_score_adj(oom_adj);
++		lowmem_adj[i] = oom_score_adj;
++		lowmem_print(1, "oom_adj %d => oom_score_adj %d\n",
++			     oom_adj, oom_score_adj);
++	}
++}
++
++static int lowmem_adj_array_set(const char *val, const struct kernel_param *kp)
++{
++	int ret;
++
++	ret = param_array_ops.set(val, kp);
++
++	/* HACK: Autodetect oom_adj values in lowmem_adj array */
++	lowmem_autodetect_oom_adj_values();
++
++	return ret;
++}
++
++static int lowmem_adj_array_get(char *buffer, const struct kernel_param *kp)
++{
++	return param_array_ops.get(buffer, kp);
++}
++
++static void lowmem_adj_array_free(void *arg)
++{
++	param_array_ops.free(arg);
++}
++
++static struct kernel_param_ops lowmem_adj_array_ops = {
++	.set = lowmem_adj_array_set,
++	.get = lowmem_adj_array_get,
++	.free = lowmem_adj_array_free,
++};
++
++static const struct kparam_array __param_arr_adj = {
++	.max = ARRAY_SIZE(lowmem_adj),
++	.num = &lowmem_adj_size,
++	.ops = &param_ops_int,
++	.elemsize = sizeof(lowmem_adj[0]),
++	.elem = lowmem_adj,
++};
++#endif
++
+ module_param_named(cost, lowmem_shrinker.seeks, int, S_IRUGO | S_IWUSR);
++#ifdef CONFIG_ANDROID_LOW_MEMORY_KILLER_AUTODETECT_OOM_ADJ_VALUES
++__module_param_call(MODULE_PARAM_PREFIX, adj,
++		    &lowmem_adj_array_ops,
++		    .arr = &__param_arr_adj,
++		    S_IRUGO | S_IWUSR, -1);
++__MODULE_PARM_TYPE(adj, "array of int");
++#else
+ module_param_array_named(adj, lowmem_adj, int, &lowmem_adj_size,
+ 			 S_IRUGO | S_IWUSR);
++#endif
+ module_param_array_named(minfree, lowmem_minfree, uint, &lowmem_minfree_size,
+ 			 S_IRUGO | S_IWUSR);
+ module_param_named(debug_level, lowmem_debug_level, uint, S_IRUGO | S_IWUSR);
+diff --git a/drivers/staging/android/persistent_ram.c b/drivers/staging/android/persistent_ram.c
+index 3d986ce..e9e08fd 100644
+--- a/drivers/staging/android/persistent_ram.c
++++ b/drivers/staging/android/persistent_ram.c
+@@ -20,10 +20,10 @@
+ #include <linux/io.h>
+ #include <linux/list.h>
+ #include <linux/memblock.h>
++#include <linux/persistent_ram.h>
+ #include <linux/rslib.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+-#include "persistent_ram.h"
+ 
+ struct persistent_ram_buffer {
+ 	uint32_t    sig;
+@@ -34,7 +34,7 @@ struct persistent_ram_buffer {
+ 
+ #define PERSISTENT_RAM_SIG (0x43474244) /* DBGC */
+ 
+-static __initdata LIST_HEAD(persistent_ram_list);
++static __devinitdata LIST_HEAD(persistent_ram_list);
+ 
+ static inline size_t buffer_size(struct persistent_ram_zone *prz)
+ {
+@@ -173,7 +173,7 @@ static void persistent_ram_ecc_old(struct persistent_ram_zone *prz)
+ }
+ 
+ static int persistent_ram_init_ecc(struct persistent_ram_zone *prz,
+-	size_t buffer_size)
++	size_t buffer_size, struct persistent_ram *ram)
+ {
+ 	int numerr;
+ 	struct persistent_ram_buffer *buffer = prz->buffer;
+@@ -182,12 +182,13 @@ static int persistent_ram_init_ecc(struct persistent_ram_zone *prz,
+ 	if (!prz->ecc)
+ 		return 0;
+ 
+-	prz->ecc_block_size = 128;
+-	prz->ecc_size = 16;
+-	prz->ecc_symsize = 8;
+-	prz->ecc_poly = 0x11d;
++	prz->ecc_block_size = ram->ecc_block_size ?: 128;
++	prz->ecc_size = ram->ecc_size ?: 16;
++	prz->ecc_symsize = ram->ecc_symsize ?: 8;
++	prz->ecc_poly = ram->ecc_poly ?: 0x11d;
+ 
+-	ecc_blocks = DIV_ROUND_UP(prz->buffer_size, prz->ecc_block_size);
++	ecc_blocks = DIV_ROUND_UP(prz->buffer_size - prz->ecc_size,
++				  prz->ecc_block_size + prz->ecc_size);
+ 	prz->buffer_size -= (ecc_blocks + 1) * prz->ecc_size;
+ 
+ 	if (prz->buffer_size > buffer_size) {
+@@ -249,7 +250,7 @@ static void notrace persistent_ram_update(struct persistent_ram_zone *prz,
+ 	persistent_ram_update_ecc(prz, start, count);
+ }
+ 
+-static void __init
++static void __devinit
+ persistent_ram_save_old(struct persistent_ram_zone *prz)
+ {
+ 	struct persistent_ram_buffer *buffer = prz->buffer;
+@@ -356,8 +357,8 @@ static int persistent_ram_buffer_map(phys_addr_t start, phys_addr_t size,
+ 	return 0;
+ }
+ 
+-static int __init persistent_ram_buffer_init(const char *name,
+-		struct persistent_ram_zone *prz)
++static int __devinit persistent_ram_buffer_init(const char *name,
++		struct persistent_ram_zone *prz, struct persistent_ram **ramp)
+ {
+ 	int i;
+ 	struct persistent_ram *ram;
+@@ -368,9 +369,11 @@ static int __init persistent_ram_buffer_init(const char *name,
+ 		start = ram->start;
+ 		for (i = 0; i < ram->num_descs; i++) {
+ 			desc = &ram->descs[i];
+-			if (!strcmp(desc->name, name))
++			if (!strcmp(desc->name, name)) {
++				*ramp = ram;
+ 				return persistent_ram_buffer_map(start,
+ 						desc->size, prz);
++			}
+ 			start += desc->size;
+ 		}
+ 	}
+@@ -378,9 +381,10 @@ static int __init persistent_ram_buffer_init(const char *name,
+ 	return -EINVAL;
+ }
+ 
+-static  __init
++static  __devinit
+ struct persistent_ram_zone *__persistent_ram_init(struct device *dev, bool ecc)
+ {
++	struct persistent_ram *ram;
+ 	struct persistent_ram_zone *prz;
+ 	int ret = -ENOMEM;
+ 
+@@ -392,14 +396,14 @@ struct persistent_ram_zone *__persistent_ram_init(struct device *dev, bool ecc)
+ 
+ 	INIT_LIST_HEAD(&prz->node);
+ 
+-	ret = persistent_ram_buffer_init(dev_name(dev), prz);
++	ret = persistent_ram_buffer_init(dev_name(dev), prz, &ram);
+ 	if (ret) {
+ 		pr_err("persistent_ram: failed to initialize buffer\n");
+ 		goto err;
+ 	}
+ 
+ 	prz->ecc = ecc;
+-	ret = persistent_ram_init_ecc(prz, prz->buffer_size);
++	ret = persistent_ram_init_ecc(prz, prz->buffer_size, ram);
+ 	if (ret)
+ 		goto err;
+ 
+@@ -407,11 +411,11 @@ struct persistent_ram_zone *__persistent_ram_init(struct device *dev, bool ecc)
+ 		if (buffer_size(prz) > prz->buffer_size ||
+ 		    buffer_start(prz) > buffer_size(prz))
+ 			pr_info("persistent_ram: found existing invalid buffer,"
+-				" size %ld, start %ld\n",
++				" size %zu, start %zu\n",
+ 			       buffer_size(prz), buffer_start(prz));
+ 		else {
+ 			pr_info("persistent_ram: found existing buffer,"
+-				" size %ld, start %ld\n",
++				" size %zu, start %zu\n",
+ 			       buffer_size(prz), buffer_start(prz));
+ 			persistent_ram_save_old(prz);
+ 		}
+@@ -430,7 +434,7 @@ err:
+ 	return ERR_PTR(ret);
+ }
+ 
+-struct persistent_ram_zone * __init
++struct persistent_ram_zone * __devinit
+ persistent_ram_init_ringbuffer(struct device *dev, bool ecc)
+ {
+ 	return __persistent_ram_init(dev, ecc);
+diff --git a/drivers/staging/android/persistent_ram.h b/drivers/staging/android/persistent_ram.h
+deleted file mode 100644
+index f41e208..0000000
+--- a/drivers/staging/android/persistent_ram.h
++++ /dev/null
+@@ -1,78 +0,0 @@
+-/*
+- * Copyright (C) 2011 Google, Inc.
+- *
+- * This software is licensed under the terms of the GNU General Public
+- * License version 2, as published by the Free Software Foundation, and
+- * may be copied, distributed, and modified under those terms.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- */
+-
+-#ifndef __LINUX_PERSISTENT_RAM_H__
+-#define __LINUX_PERSISTENT_RAM_H__
+-
+-#include <linux/device.h>
+-#include <linux/kernel.h>
+-#include <linux/list.h>
+-#include <linux/types.h>
+-
+-struct persistent_ram_buffer;
+-
+-struct persistent_ram_descriptor {
+-	const char	*name;
+-	phys_addr_t	size;
+-};
+-
+-struct persistent_ram {
+-	phys_addr_t	start;
+-	phys_addr_t	size;
+-
+-	int					num_descs;
+-	struct persistent_ram_descriptor	*descs;
+-
+-	struct list_head node;
+-};
+-
+-struct persistent_ram_zone {
+-	struct list_head node;
+-	void *vaddr;
+-	struct persistent_ram_buffer *buffer;
+-	size_t buffer_size;
+-
+-	/* ECC correction */
+-	bool ecc;
+-	char *par_buffer;
+-	char *par_header;
+-	struct rs_control *rs_decoder;
+-	int corrected_bytes;
+-	int bad_blocks;
+-	int ecc_block_size;
+-	int ecc_size;
+-	int ecc_symsize;
+-	int ecc_poly;
+-
+-	char *old_log;
+-	size_t old_log_size;
+-	size_t old_log_footer_size;
+-	bool early;
+-};
+-
+-int persistent_ram_early_init(struct persistent_ram *ram);
+-
+-struct persistent_ram_zone *persistent_ram_init_ringbuffer(struct device *dev,
+-		bool ecc);
+-
+-int persistent_ram_write(struct persistent_ram_zone *prz, const void *s,
+-	unsigned int count);
+-
+-size_t persistent_ram_old_size(struct persistent_ram_zone *prz);
+-void *persistent_ram_old(struct persistent_ram_zone *prz);
+-void persistent_ram_free_old(struct persistent_ram_zone *prz);
+-ssize_t persistent_ram_ecc_string(struct persistent_ram_zone *prz,
+-	char *str, size_t len);
+-
+-#endif
+diff --git a/drivers/staging/android/ram_console.c b/drivers/staging/android/ram_console.c
+index ce140ff..cf0f8fb 100644
+--- a/drivers/staging/android/ram_console.c
++++ b/drivers/staging/android/ram_console.c
+@@ -16,12 +16,12 @@
+ #include <linux/console.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
++#include <linux/persistent_ram.h>
+ #include <linux/platform_device.h>
+ #include <linux/proc_fs.h>
+ #include <linux/string.h>
+ #include <linux/uaccess.h>
+ #include <linux/io.h>
+-#include "persistent_ram.h"
+ #include "ram_console.h"
+ 
+ static struct persistent_ram_zone *ram_console_zone;
+@@ -50,7 +50,7 @@ void ram_console_enable_console(int enabled)
+ 		ram_console.flags &= ~CON_ENABLED;
+ }
+ 
+-static int __init ram_console_probe(struct platform_device *pdev)
++static int __devinit ram_console_probe(struct platform_device *pdev)
+ {
+ 	struct ram_console_platform_data *pdata = pdev->dev.platform_data;
+ 	struct persistent_ram_zone *prz;
+@@ -78,11 +78,12 @@ static struct platform_driver ram_console_driver = {
+ 	.driver		= {
+ 		.name	= "ram_console",
+ 	},
++	.probe = ram_console_probe,
+ };
+ 
+ static int __init ram_console_module_init(void)
+ {
+-	return platform_driver_probe(&ram_console_driver, ram_console_probe);
++	return platform_driver_register(&ram_console_driver);
+ }
+ 
+ #ifndef CONFIG_PRINTK
+@@ -100,9 +101,6 @@ static ssize_t ram_console_read_old(struct file *file, char __user *buf,
+ 	char *str;
+ 	int ret;
+ 
+-	if (dmesg_restrict && !capable(CAP_SYSLOG))
+-		return -EPERM;
+-
+ 	/* Main last_kmsg log */
+ 	if (pos < old_log_size) {
+ 		count = min(len, (size_t)(old_log_size - pos));
+diff --git a/drivers/staging/android/trace_persistent.c b/drivers/staging/android/trace_persistent.c
+new file mode 100644
+index 0000000..7c3e949
+--- /dev/null
++++ b/drivers/staging/android/trace_persistent.c
+@@ -0,0 +1,242 @@
++/*
++ * Copyright (C) 2012 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/debugfs.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/persistent_ram.h>
++#include <linux/platform_device.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++
++#include "../../../kernel/trace/trace.h"
++
++struct persistent_trace_record {
++	unsigned long ip;
++	unsigned long parent_ip;
++};
++
++#define REC_SIZE sizeof(struct persistent_trace_record)
++
++static struct persistent_ram_zone *persistent_trace;
++
++static int persistent_trace_enabled;
++
++static struct trace_array *persistent_trace_array;
++
++static struct ftrace_ops trace_ops;
++
++static int persistent_tracer_init(struct trace_array *tr)
++{
++	persistent_trace_array = tr;
++	tr->cpu = get_cpu();
++	put_cpu();
++
++	tracing_start_cmdline_record();
++
++	persistent_trace_enabled = 0;
++	smp_wmb();
++
++	register_ftrace_function(&trace_ops);
++
++	smp_wmb();
++	persistent_trace_enabled = 1;
++
++	return 0;
++}
++
++static void persistent_trace_reset(struct trace_array *tr)
++{
++	persistent_trace_enabled = 0;
++	smp_wmb();
++
++	unregister_ftrace_function(&trace_ops);
++
++	tracing_stop_cmdline_record();
++}
++
++static void persistent_trace_start(struct trace_array *tr)
++{
++	tracing_reset_online_cpus(tr);
++}
++
++static void persistent_trace_call(unsigned long ip, unsigned long parent_ip)
++{
++	struct trace_array *tr = persistent_trace_array;
++	struct trace_array_cpu *data;
++	long disabled;
++	struct persistent_trace_record rec;
++	unsigned long flags;
++	int cpu;
++
++	smp_rmb();
++	if (unlikely(!persistent_trace_enabled))
++		return;
++
++	if (unlikely(oops_in_progress))
++		return;
++
++	/*
++	 * Need to use raw, since this must be called before the
++	 * recursive protection is performed.
++	 */
++	local_irq_save(flags);
++	cpu = raw_smp_processor_id();
++	data = tr->data[cpu];
++	disabled = atomic_inc_return(&data->disabled);
++
++	if (likely(disabled == 1)) {
++		rec.ip = ip;
++		rec.parent_ip = parent_ip;
++		rec.ip |= cpu;
++		persistent_ram_write(persistent_trace, &rec, sizeof(rec));
++	}
++
++	atomic_dec(&data->disabled);
++	local_irq_restore(flags);
++}
++
++static struct ftrace_ops trace_ops __read_mostly = {
++	.func = persistent_trace_call,
++	.flags = FTRACE_OPS_FL_GLOBAL,
++};
++
++static struct tracer persistent_tracer __read_mostly = {
++	.name		= "persistent",
++	.init		= persistent_tracer_init,
++	.reset		= persistent_trace_reset,
++	.start		= persistent_trace_start,
++	.wait_pipe	= poll_wait_pipe,
++};
++
++struct persistent_trace_seq_data {
++	const void *ptr;
++	size_t off;
++	size_t size;
++};
++
++void *persistent_trace_seq_start(struct seq_file *s, loff_t *pos)
++{
++	struct persistent_trace_seq_data *data;
++
++	data = kzalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return NULL;
++
++	data->ptr = persistent_ram_old(persistent_trace);
++	data->size = persistent_ram_old_size(persistent_trace);
++	data->off = data->size % REC_SIZE;
++
++	data->off += *pos * REC_SIZE;
++
++	if (data->off + REC_SIZE > data->size) {
++		kfree(data);
++		return NULL;
++	}
++
++	return data;
++
++}
++void persistent_trace_seq_stop(struct seq_file *s, void *v)
++{
++	kfree(v);
++}
++
++void *persistent_trace_seq_next(struct seq_file *s, void *v, loff_t *pos)
++{
++	struct persistent_trace_seq_data *data = v;
++
++	data->off += REC_SIZE;
++
++	if (data->off + REC_SIZE > data->size)
++		return NULL;
++
++	(*pos)++;
++
++	return data;
++}
++
++int persistent_trace_seq_show(struct seq_file *s, void *v)
++{
++	struct persistent_trace_seq_data *data = v;
++	struct persistent_trace_record *rec;
++
++	rec = (struct persistent_trace_record *)(data->ptr + data->off);
++
++	seq_printf(s, "%ld %08lx  %08lx  %pf <- %pF\n",
++		rec->ip & 3, rec->ip, rec->parent_ip,
++		(void *)rec->ip, (void *)rec->parent_ip);
++
++	return 0;
++}
++
++static const struct seq_operations persistent_trace_seq_ops = {
++	.start = persistent_trace_seq_start,
++	.next = persistent_trace_seq_next,
++	.stop = persistent_trace_seq_stop,
++	.show = persistent_trace_seq_show,
++};
++
++static int persistent_trace_old_open(struct inode *inode, struct file *file)
++{
++	return seq_open(file, &persistent_trace_seq_ops);
++}
++
++static const struct file_operations persistent_trace_old_fops = {
++	.open		= persistent_trace_old_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
++
++static int __devinit persistent_trace_probe(struct platform_device *pdev)
++{
++	struct dentry *d;
++	int ret;
++
++	persistent_trace = persistent_ram_init_ringbuffer(&pdev->dev, false);
++	if (IS_ERR(persistent_trace)) {
++		pr_err("persistent_trace: failed to init ringbuffer: %ld\n",
++				PTR_ERR(persistent_trace));
++		return PTR_ERR(persistent_trace);
++	}
++
++	ret = register_tracer(&persistent_tracer);
++	if (ret)
++		pr_err("persistent_trace: failed to register tracer");
++
++	if (persistent_ram_old_size(persistent_trace) > 0) {
++		d = debugfs_create_file("persistent_trace", S_IRUGO, NULL,
++			NULL, &persistent_trace_old_fops);
++		if (IS_ERR_OR_NULL(d))
++			pr_err("persistent_trace: failed to create old file\n");
++	}
++
++	return 0;
++}
++
++static struct platform_driver persistent_trace_driver  = {
++	.probe = persistent_trace_probe,
++	.driver		= {
++		.name	= "persistent_trace",
++	},
++};
++
++static int __init persistent_trace_init(void)
++{
++	return platform_driver_register(&persistent_trace_driver);
++}
++core_initcall(persistent_trace_init);
+diff --git a/drivers/staging/iio/industrialio-event.c b/drivers/staging/iio/industrialio-event.c
+index 5fdf739..68ef826 100644
+--- a/drivers/staging/iio/industrialio-event.c
++++ b/drivers/staging/iio/industrialio-event.c
+@@ -35,6 +35,7 @@
+  */
+ struct iio_event_interface {
+ 	wait_queue_head_t	wait;
++	struct mutex		read_lock;
+ 	DECLARE_KFIFO(det_events, struct iio_event_data, 16);
+ 
+ 	struct list_head	dev_attr_list;
+@@ -96,14 +97,16 @@ static ssize_t iio_event_chrdev_read(struct file *filep,
+ 	if (count < sizeof(struct iio_event_data))
+ 		return -EINVAL;
+ 
+-	spin_lock(&ev_int->wait.lock);
++	if (mutex_lock_interruptible(&ev_int->read_lock))
++		return -ERESTARTSYS;
++
+ 	if (kfifo_is_empty(&ev_int->det_events)) {
+ 		if (filep->f_flags & O_NONBLOCK) {
+ 			ret = -EAGAIN;
+ 			goto error_unlock;
+ 		}
+ 		/* Blocking on device; waiting for something to be there */
+-		ret = wait_event_interruptible_locked(ev_int->wait,
++		ret = wait_event_interruptible(ev_int->wait,
+ 					!kfifo_is_empty(&ev_int->det_events));
+ 		if (ret)
+ 			goto error_unlock;
+@@ -113,7 +116,7 @@ static ssize_t iio_event_chrdev_read(struct file *filep,
+ 	ret = kfifo_to_user(&ev_int->det_events, buf, count, &copied);
+ 
+ error_unlock:
+-	spin_unlock(&ev_int->wait.lock);
++	mutex_unlock(&ev_int->read_lock);
+ 
+ 	return ret ? ret : copied;
+ }
+@@ -376,6 +379,7 @@ static void iio_setup_ev_int(struct iio_event_interface *ev_int)
+ {
+ 	INIT_KFIFO(ev_int->det_events);
+ 	init_waitqueue_head(&ev_int->wait);
++	mutex_init(&ev_int->read_lock);
+ }
+ 
+ static const char *iio_event_group_name = "events";
+@@ -437,6 +441,7 @@ int iio_device_register_eventset(struct iio_dev *indio_dev)
+ 
+ error_free_setup_event_lines:
+ 	__iio_remove_event_config_attrs(indio_dev);
++	mutex_destroy(&indio_dev->event_interface->read_lock);
+ 	kfree(indio_dev->event_interface);
+ error_ret:
+ 
+@@ -449,5 +454,6 @@ void iio_device_unregister_eventset(struct iio_dev *indio_dev)
+ 		return;
+ 	__iio_remove_event_config_attrs(indio_dev);
+ 	kfree(indio_dev->event_interface->group.attrs);
++	mutex_destroy(&indio_dev->event_interface->read_lock);
+ 	kfree(indio_dev->event_interface);
+ }

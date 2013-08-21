@@ -1,0 +1,2922 @@
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index c779509..fc984e8 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -51,6 +51,31 @@ config AD525X_DPOT_SPI
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called ad525x_dpot-spi.
+ 
++config SUN4I_VIBRATOR
++	tristate "Vibrator sun4i platform"
++	depends on ANDROID_TIMED_OUTPUT
++	help
++	  Say Y here if you have a vibrator on your board.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called sun4i-vibrator.
++
++config SUN4I_GPIO_UGLY
++	tristate "An ugly sun4i gpio driver"
++	help
++	  Say Y here if you want to use gpio as general input/output.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called sun4i-gpio.
++
++config SUNXI_DBGREG
++	tristate "Sunxi platform register debug driver"
++	help
++	  Say Y here if you want to read/write registers in userspace.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called sun4i-dbgreg.
++
+ config ATMEL_PWM
+ 	tristate "Atmel AT32/AT91 PWM support"
+ 	depends on HAVE_CLK
+@@ -60,6 +85,17 @@ config ATMEL_PWM
+ 	  purposes including software controlled power-efficient backlights
+ 	  on LCD displays, motor control, and waveform generation.
+ 
++config SUNXI_PWM 
++	tristate "Sunxi PWM Driver (pwm-sunxi)" 
++	help 
++	  Say Y here if you want Hardware PWM Support 
++ 
++	  To compile this driver as a module, choose M here: the 
++	  module will be called pwm-sunxi.  This driver supports 
++	  a sysfs interface at /sys/class/pwm-sunxi as well as the 
++	  kernel pwm interface. 
++ 
++
+ config AB8500_PWM
+ 	bool "AB8500 PWM support"
+ 	depends on AB8500_CORE && ARCH_U8500
+@@ -382,6 +418,14 @@ config HMC6352
+ 	  This driver provides support for the Honeywell HMC6352 compass,
+ 	  providing configuration and heading data via sysfs.
+ 
++config SENSORS_AK8975
++	tristate "AK8975 compass support"
++	default n
++	depends on I2C
++	help
++	  If you say yes here you get support for Asahi Kasei's
++	  orientation sensor AK8975.
++
+ config EP93XX_PWM
+ 	tristate "EP93xx PWM support"
+ 	depends on ARCH_EP93XX
+@@ -425,6 +469,10 @@ config TI_DAC7512
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called ti_dac7512.
+ 
++config UID_STAT
++	bool "UID based statistics tracking exported to /proc/uid_stat"
++	default n
++
+ config VMWARE_BALLOON
+ 	tristate "VMware Balloon Driver"
+ 	depends on X86
+@@ -498,6 +546,14 @@ config MAX8997_MUIC
+ 	  Maxim MAX8997 PMIC.
+ 	  The MAX8997 MUIC is a USB port accessory detector and switch.
+ 
++config WL127X_RFKILL
++	tristate "Bluetooth power control driver for TI wl127x"
++	depends on RFKILL
++	default n
++	---help---
++	 Creates an rfkill entry in sysfs for power control of Bluetooth
++	 TI wl127x chips.
++	 
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 3e1d8010..10401d4 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -33,6 +33,7 @@ obj-$(CONFIG_SENSORS_TSL2550)	+= tsl2550.o
+ obj-$(CONFIG_EP93XX_PWM)	+= ep93xx_pwm.o
+ obj-$(CONFIG_DS1682)		+= ds1682.o
+ obj-$(CONFIG_TI_DAC7512)	+= ti_dac7512.o
++obj-$(CONFIG_UID_STAT)		+= uid_stat.o
+ obj-$(CONFIG_C2PORT)		+= c2port/
+ obj-$(CONFIG_IWMC3200TOP)      += iwmc3200top/
+ obj-$(CONFIG_HMC6352)		+= hmc6352.o
+@@ -49,3 +50,9 @@ obj-y				+= carma/
+ obj-$(CONFIG_USB_SWITCH_FSA9480) += fsa9480.o
+ obj-$(CONFIG_ALTERA_STAPL)	+=altera-stapl/
+ obj-$(CONFIG_MAX8997_MUIC)	+= max8997-muic.o
++obj-$(CONFIG_WL127X_RFKILL)	+= wl127x-rfkill.o
++obj-$(CONFIG_SENSORS_AK8975)	+= akm8975.o
++obj-$(CONFIG_SUN4I_VIBRATOR)	+= sun4i-vibrator.o
++obj-$(CONFIG_SUN4I_GPIO_UGLY)	+= sun4i-gpio.o
++obj-$(CONFIG_SUNXI_DBGREG)		+= sunxi-dbgreg.o
++obj-$(CONFIG_SUNXI_PWM)		+= pwm-sunxi.o 
+diff --git a/drivers/misc/akm8975.c b/drivers/misc/akm8975.c
+new file mode 100644
+index 0000000..830d289
+--- /dev/null
++++ b/drivers/misc/akm8975.c
+@@ -0,0 +1,732 @@
++/* drivers/misc/akm8975.c - akm8975 compass driver
++ *
++ * Copyright (C) 2007-2008 HTC Corporation.
++ * Author: Hou-Kun Chen <houkun.chen@gmail.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++/*
++ * Revised by AKM 2009/04/02
++ * Revised by Motorola 2010/05/27
++ *
++ */
++
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++#include <linux/irq.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio.h>
++#include <linux/uaccess.h>
++#include <linux/delay.h>
++#include <linux/input.h>
++#include <linux/workqueue.h>
++#include <linux/freezer.h>
++#include <linux/akm8975.h>
++#include <linux/earlysuspend.h>
++
++#define AK8975DRV_CALL_DBG 0
++#if AK8975DRV_CALL_DBG
++#define FUNCDBG(msg)	pr_err("%s:%s\n", __func__, msg);
++#else
++#define FUNCDBG(msg)
++#endif
++
++#define AK8975DRV_DATA_DBG 0
++#define MAX_FAILURE_COUNT 10
++
++struct akm8975_data {
++	struct i2c_client *this_client;
++	struct akm8975_platform_data *pdata;
++	struct input_dev *input_dev;
++	struct work_struct work;
++	struct mutex flags_lock;
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	struct early_suspend early_suspend;
++#endif
++};
++
++/*
++* Because misc devices can not carry a pointer from driver register to
++* open, we keep this global. This limits the driver to a single instance.
++*/
++struct akm8975_data *akmd_data;
++
++static DECLARE_WAIT_QUEUE_HEAD(open_wq);
++
++static atomic_t open_flag;
++
++static short m_flag;
++static short a_flag;
++static short t_flag;
++static short mv_flag;
++
++static short akmd_delay;
++
++static ssize_t akm8975_show(struct device *dev, struct device_attribute *attr,
++				 char *buf)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	return sprintf(buf, "%u\n", i2c_smbus_read_byte_data(client,
++							     AK8975_REG_CNTL));
++}
++static ssize_t akm8975_store(struct device *dev, struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	struct i2c_client *client = to_i2c_client(dev);
++	unsigned long val;
++	strict_strtoul(buf, 10, &val);
++	if (val > 0xff)
++		return -EINVAL;
++	i2c_smbus_write_byte_data(client, AK8975_REG_CNTL, val);
++	return count;
++}
++static DEVICE_ATTR(akm_ms1, S_IWUSR | S_IRUGO, akm8975_show, akm8975_store);
++
++static int akm8975_i2c_rxdata(struct akm8975_data *akm, char *buf, int length)
++{
++	struct i2c_msg msgs[] = {
++		{
++			.addr = akm->this_client->addr,
++			.flags = 0,
++			.len = 1,
++			.buf = buf,
++		},
++		{
++			.addr = akm->this_client->addr,
++			.flags = I2C_M_RD,
++			.len = length,
++			.buf = buf,
++		},
++	};
++
++	FUNCDBG("called");
++
++	if (i2c_transfer(akm->this_client->adapter, msgs, 2) < 0) {
++		pr_err("akm8975_i2c_rxdata: transfer error\n");
++		return EIO;
++	} else
++		return 0;
++}
++
++static int akm8975_i2c_txdata(struct akm8975_data *akm, char *buf, int length)
++{
++	struct i2c_msg msgs[] = {
++		{
++			.addr = akm->this_client->addr,
++			.flags = 0,
++			.len = length,
++			.buf = buf,
++		},
++	};
++
++	FUNCDBG("called");
++
++	if (i2c_transfer(akm->this_client->adapter, msgs, 1) < 0) {
++		pr_err("akm8975_i2c_txdata: transfer error\n");
++		return -EIO;
++	} else
++		return 0;
++}
++
++static void akm8975_ecs_report_value(struct akm8975_data *akm, short *rbuf)
++{
++	struct akm8975_data *data = i2c_get_clientdata(akm->this_client);
++
++	FUNCDBG("called");
++
++#if AK8975DRV_DATA_DBG
++	pr_info("akm8975_ecs_report_value: yaw = %d, pitch = %d, roll = %d\n",
++				 rbuf[0], rbuf[1], rbuf[2]);
++	pr_info("tmp = %d, m_stat= %d, g_stat=%d\n", rbuf[3], rbuf[4], rbuf[5]);
++	pr_info("Acceleration:	 x = %d LSB, y = %d LSB, z = %d LSB\n",
++				 rbuf[6], rbuf[7], rbuf[8]);
++	pr_info("Magnetic:	 x = %d LSB, y = %d LSB, z = %d LSB\n\n",
++				 rbuf[9], rbuf[10], rbuf[11]);
++#endif
++	mutex_lock(&akm->flags_lock);
++	/* Report magnetic sensor information */
++	if (m_flag) {
++		input_report_abs(data->input_dev, ABS_RX, rbuf[0]);
++		input_report_abs(data->input_dev, ABS_RY, rbuf[1]);
++		input_report_abs(data->input_dev, ABS_RZ, rbuf[2]);
++		input_report_abs(data->input_dev, ABS_RUDDER, rbuf[4]);
++	}
++
++	/* Report acceleration sensor information */
++	if (a_flag) {
++		input_report_abs(data->input_dev, ABS_X, rbuf[6]);
++		input_report_abs(data->input_dev, ABS_Y, rbuf[7]);
++		input_report_abs(data->input_dev, ABS_Z, rbuf[8]);
++		input_report_abs(data->input_dev, ABS_WHEEL, rbuf[5]);
++	}
++
++	/* Report temperature information */
++	if (t_flag)
++		input_report_abs(data->input_dev, ABS_THROTTLE, rbuf[3]);
++
++	if (mv_flag) {
++		input_report_abs(data->input_dev, ABS_HAT0X, rbuf[9]);
++		input_report_abs(data->input_dev, ABS_HAT0Y, rbuf[10]);
++		input_report_abs(data->input_dev, ABS_BRAKE, rbuf[11]);
++	}
++	mutex_unlock(&akm->flags_lock);
++
++	input_sync(data->input_dev);
++}
++
++static void akm8975_ecs_close_done(struct akm8975_data *akm)
++{
++	FUNCDBG("called");
++	mutex_lock(&akm->flags_lock);
++	m_flag = 1;
++	a_flag = 1;
++	t_flag = 1;
++	mv_flag = 1;
++	mutex_unlock(&akm->flags_lock);
++}
++
++static int akm_aot_open(struct inode *inode, struct file *file)
++{
++	int ret = -1;
++
++	FUNCDBG("called");
++	if (atomic_cmpxchg(&open_flag, 0, 1) == 0) {
++		wake_up(&open_wq);
++		ret = 0;
++	}
++
++	ret = nonseekable_open(inode, file);
++	if (ret)
++		return ret;
++
++	file->private_data = akmd_data;
++
++	return ret;
++}
++
++static int akm_aot_release(struct inode *inode, struct file *file)
++{
++	FUNCDBG("called");
++	atomic_set(&open_flag, 0);
++	wake_up(&open_wq);
++	return 0;
++}
++
++static int akm_aot_ioctl(struct inode *inode, struct file *file,
++	      unsigned int cmd, unsigned long arg)
++{
++	void __user *argp = (void __user *) arg;
++	short flag;
++	struct akm8975_data *akm = file->private_data;
++
++	FUNCDBG("called");
++
++	switch (cmd) {
++	case ECS_IOCTL_APP_SET_MFLAG:
++	case ECS_IOCTL_APP_SET_AFLAG:
++	case ECS_IOCTL_APP_SET_MVFLAG:
++		if (copy_from_user(&flag, argp, sizeof(flag)))
++			return -EFAULT;
++		if (flag < 0 || flag > 1)
++			return -EINVAL;
++		break;
++	case ECS_IOCTL_APP_SET_DELAY:
++		if (copy_from_user(&flag, argp, sizeof(flag)))
++			return -EFAULT;
++		break;
++	default:
++		break;
++	}
++
++	mutex_lock(&akm->flags_lock);
++	switch (cmd) {
++	case ECS_IOCTL_APP_SET_MFLAG:
++	  m_flag = flag;
++		break;
++	case ECS_IOCTL_APP_GET_MFLAG:
++		flag = m_flag;
++		break;
++	case ECS_IOCTL_APP_SET_AFLAG:
++		a_flag = flag;
++		break;
++	case ECS_IOCTL_APP_GET_AFLAG:
++		flag = a_flag;
++		break;
++	case ECS_IOCTL_APP_SET_MVFLAG:
++		mv_flag = flag;
++		break;
++	case ECS_IOCTL_APP_GET_MVFLAG:
++		flag = mv_flag;
++		break;
++	case ECS_IOCTL_APP_SET_DELAY:
++		akmd_delay = flag;
++		break;
++	case ECS_IOCTL_APP_GET_DELAY:
++		flag = akmd_delay;
++		break;
++	default:
++		return -ENOTTY;
++	}
++	mutex_unlock(&akm->flags_lock);
++
++	switch (cmd) {
++	case ECS_IOCTL_APP_GET_MFLAG:
++	case ECS_IOCTL_APP_GET_AFLAG:
++	case ECS_IOCTL_APP_GET_MVFLAG:
++	case ECS_IOCTL_APP_GET_DELAY:
++		if (copy_to_user(argp, &flag, sizeof(flag)))
++			return -EFAULT;
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++static int akmd_open(struct inode *inode, struct file *file)
++{
++	int err = 0;
++
++	FUNCDBG("called");
++	err = nonseekable_open(inode, file);
++	if (err)
++		return err;
++
++	file->private_data = akmd_data;
++	return 0;
++}
++
++static int akmd_release(struct inode *inode, struct file *file)
++{
++	struct akm8975_data *akm = file->private_data;
++
++	FUNCDBG("called");
++	akm8975_ecs_close_done(akm);
++	return 0;
++}
++
++static int akmd_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
++		      unsigned long arg)
++{
++	void __user *argp = (void __user *) arg;
++
++	char rwbuf[16];
++	int ret = -1;
++	int status;
++	short value[12];
++	short delay;
++	struct akm8975_data *akm = file->private_data;
++
++	FUNCDBG("called");
++
++	switch (cmd) {
++	case ECS_IOCTL_READ:
++	case ECS_IOCTL_WRITE:
++		if (copy_from_user(&rwbuf, argp, sizeof(rwbuf)))
++			return -EFAULT;
++		break;
++
++	case ECS_IOCTL_SET_YPR:
++		if (copy_from_user(&value, argp, sizeof(value)))
++			return -EFAULT;
++		break;
++
++	default:
++		break;
++	}
++
++	switch (cmd) {
++	case ECS_IOCTL_READ:
++		if (rwbuf[0] < 1)
++			return -EINVAL;
++
++		ret = akm8975_i2c_rxdata(akm, &rwbuf[1], rwbuf[0]);
++		if (ret < 0)
++			return ret;
++		break;
++
++	case ECS_IOCTL_WRITE:
++		if (rwbuf[0] < 2)
++			return -EINVAL;
++
++		ret = akm8975_i2c_txdata(akm, &rwbuf[1], rwbuf[0]);
++		if (ret < 0)
++			return ret;
++		break;
++	case ECS_IOCTL_SET_YPR:
++		akm8975_ecs_report_value(akm, value);
++		break;
++
++	case ECS_IOCTL_GET_OPEN_STATUS:
++		wait_event_interruptible(open_wq,
++					 (atomic_read(&open_flag) != 0));
++		status = atomic_read(&open_flag);
++		break;
++	case ECS_IOCTL_GET_CLOSE_STATUS:
++		wait_event_interruptible(open_wq,
++					 (atomic_read(&open_flag) == 0));
++		status = atomic_read(&open_flag);
++		break;
++
++	case ECS_IOCTL_GET_DELAY:
++		delay = akmd_delay;
++		break;
++
++	default:
++		FUNCDBG("Unknown cmd\n");
++		return -ENOTTY;
++	}
++
++	switch (cmd) {
++	case ECS_IOCTL_READ:
++		if (copy_to_user(argp, &rwbuf, sizeof(rwbuf)))
++			return -EFAULT;
++		break;
++	case ECS_IOCTL_GET_OPEN_STATUS:
++	case ECS_IOCTL_GET_CLOSE_STATUS:
++		if (copy_to_user(argp, &status, sizeof(status)))
++			return -EFAULT;
++		break;
++	case ECS_IOCTL_GET_DELAY:
++		if (copy_to_user(argp, &delay, sizeof(delay)))
++			return -EFAULT;
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++/* needed to clear the int. pin */
++static void akm_work_func(struct work_struct *work)
++{
++	struct akm8975_data *akm =
++	    container_of(work, struct akm8975_data, work);
++
++	FUNCDBG("called");
++	enable_irq(akm->this_client->irq);
++}
++
++static irqreturn_t akm8975_interrupt(int irq, void *dev_id)
++{
++	struct akm8975_data *akm = dev_id;
++	FUNCDBG("called");
++
++	disable_irq_nosync(akm->this_client->irq);
++	schedule_work(&akm->work);
++	return IRQ_HANDLED;
++}
++
++static int akm8975_power_off(struct akm8975_data *akm)
++{
++#if AK8975DRV_CALL_DBG
++	pr_info("%s\n", __func__);
++#endif
++	if (akm->pdata->power_off)
++		akm->pdata->power_off();
++
++	return 0;
++}
++
++static int akm8975_power_on(struct akm8975_data *akm)
++{
++	int err;
++
++#if AK8975DRV_CALL_DBG
++	pr_info("%s\n", __func__);
++#endif
++	if (akm->pdata->power_on) {
++		err = akm->pdata->power_on();
++		if (err < 0)
++			return err;
++	}
++	return 0;
++}
++
++static int akm8975_suspend(struct i2c_client *client, pm_message_t mesg)
++{
++	struct akm8975_data *akm = i2c_get_clientdata(client);
++
++#if AK8975DRV_CALL_DBG
++	pr_info("%s\n", __func__);
++#endif
++	/* TO DO: might need more work after power mgmt
++	   is enabled */
++	return akm8975_power_off(akm);
++}
++
++static int akm8975_resume(struct i2c_client *client)
++{
++	struct akm8975_data *akm = i2c_get_clientdata(client);
++
++#if AK8975DRV_CALL_DBG
++	pr_info("%s\n", __func__);
++#endif
++	/* TO DO: might need more work after power mgmt
++	   is enabled */
++	return akm8975_power_on(akm);
++}
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++static void akm8975_early_suspend(struct early_suspend *handler)
++{
++	struct akm8975_data *akm;
++	akm = container_of(handler, struct akm8975_data, early_suspend);
++
++#if AK8975DRV_CALL_DBG
++	pr_info("%s\n", __func__);
++#endif
++	akm8975_suspend(akm->this_client, PMSG_SUSPEND);
++}
++
++static void akm8975_early_resume(struct early_suspend *handler)
++{
++	struct akm8975_data *akm;
++	akm = container_of(handler, struct akm8975_data, early_suspend);
++
++#if AK8975DRV_CALL_DBG
++	pr_info("%s\n", __func__);
++#endif
++	akm8975_resume(akm->this_client);
++}
++#endif
++
++
++static int akm8975_init_client(struct i2c_client *client)
++{
++	struct akm8975_data *data;
++	int ret;
++
++	data = i2c_get_clientdata(client);
++
++	ret = request_irq(client->irq, akm8975_interrupt, IRQF_TRIGGER_RISING,
++				"akm8975", data);
++
++	if (ret < 0) {
++		pr_err("akm8975_init_client: request irq failed\n");
++		goto err;
++	}
++
++	init_waitqueue_head(&open_wq);
++
++	mutex_lock(&data->flags_lock);
++	m_flag = 1;
++	a_flag = 1;
++	t_flag = 1;
++	mv_flag = 1;
++	mutex_unlock(&data->flags_lock);
++
++	return 0;
++err:
++  return ret;
++}
++
++static const struct file_operations akmd_fops = {
++	.owner = THIS_MODULE,
++	.open = akmd_open,
++	.release = akmd_release,
++	.ioctl = akmd_ioctl,
++};
++
++static const struct file_operations akm_aot_fops = {
++	.owner = THIS_MODULE,
++	.open = akm_aot_open,
++	.release = akm_aot_release,
++	.ioctl = akm_aot_ioctl,
++};
++
++static struct miscdevice akm_aot_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "akm8975_aot",
++	.fops = &akm_aot_fops,
++};
++
++static struct miscdevice akmd_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "akm8975_dev",
++	.fops = &akmd_fops,
++};
++
++int akm8975_probe(struct i2c_client *client,
++		  const struct i2c_device_id *devid)
++{
++	struct akm8975_data *akm;
++	int err;
++	FUNCDBG("called");
++
++	if (client->dev.platform_data == NULL) {
++		dev_err(&client->dev, "platform data is NULL. exiting.\n");
++		err = -ENODEV;
++		goto exit_platform_data_null;
++	}
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
++		dev_err(&client->dev, "platform data is NULL. exiting.\n");
++		err = -ENODEV;
++		goto exit_check_functionality_failed;
++	}
++
++	akm = kzalloc(sizeof(struct akm8975_data), GFP_KERNEL);
++	if (!akm) {
++		dev_err(&client->dev,
++			"failed to allocate memory for module data\n");
++		err = -ENOMEM;
++		goto exit_alloc_data_failed;
++	}
++
++	akm->pdata = client->dev.platform_data;
++
++	mutex_init(&akm->flags_lock);
++	INIT_WORK(&akm->work, akm_work_func);
++	i2c_set_clientdata(client, akm);
++
++	err = akm8975_power_on(akm);
++	if (err < 0)
++		goto exit_power_on_failed;
++
++	akm8975_init_client(client);
++	akm->this_client = client;
++	akmd_data = akm;
++
++	akm->input_dev = input_allocate_device();
++	if (!akm->input_dev) {
++		err = -ENOMEM;
++		dev_err(&akm->this_client->dev,
++			"input device allocate failed\n");
++		goto exit_input_dev_alloc_failed;
++	}
++
++	set_bit(EV_ABS, akm->input_dev->evbit);
++
++	/* yaw */
++	input_set_abs_params(akm->input_dev, ABS_RX, 0, 23040, 0, 0);
++	/* pitch */
++	input_set_abs_params(akm->input_dev, ABS_RY, -11520, 11520, 0, 0);
++	/* roll */
++	input_set_abs_params(akm->input_dev, ABS_RZ, -5760, 5760, 0, 0);
++	/* x-axis acceleration */
++	input_set_abs_params(akm->input_dev, ABS_X, -5760, 5760, 0, 0);
++	/* y-axis acceleration */
++	input_set_abs_params(akm->input_dev, ABS_Y, -5760, 5760, 0, 0);
++	/* z-axis acceleration */
++	input_set_abs_params(akm->input_dev, ABS_Z, -5760, 5760, 0, 0);
++	/* temparature */
++	input_set_abs_params(akm->input_dev, ABS_THROTTLE, -30, 85, 0, 0);
++	/* status of magnetic sensor */
++	input_set_abs_params(akm->input_dev, ABS_RUDDER, 0, 3, 0, 0);
++	/* status of acceleration sensor */
++	input_set_abs_params(akm->input_dev, ABS_WHEEL, 0, 3, 0, 0);
++	/* x-axis of raw magnetic vector */
++	input_set_abs_params(akm->input_dev, ABS_HAT0X, -20480, 20479, 0, 0);
++	/* y-axis of raw magnetic vector */
++	input_set_abs_params(akm->input_dev, ABS_HAT0Y, -20480, 20479, 0, 0);
++	/* z-axis of raw magnetic vector */
++	input_set_abs_params(akm->input_dev, ABS_BRAKE, -20480, 20479, 0, 0);
++
++	akm->input_dev->name = "compass";
++
++	err = input_register_device(akm->input_dev);
++	if (err) {
++		pr_err("akm8975_probe: Unable to register input device: %s\n",
++					 akm->input_dev->name);
++		goto exit_input_register_device_failed;
++	}
++
++	err = misc_register(&akmd_device);
++	if (err) {
++		pr_err("akm8975_probe: akmd_device register failed\n");
++		goto exit_misc_device_register_failed;
++	}
++
++	err = misc_register(&akm_aot_device);
++	if (err) {
++		pr_err("akm8975_probe: akm_aot_device register failed\n");
++		goto exit_misc_device_register_failed;
++	}
++
++	err = device_create_file(&client->dev, &dev_attr_akm_ms1);
++
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	akm->early_suspend.suspend = akm8975_early_suspend;
++	akm->early_suspend.resume = akm8975_early_resume;
++	register_early_suspend(&akm->early_suspend);
++#endif
++	return 0;
++
++exit_misc_device_register_failed:
++exit_input_register_device_failed:
++	input_free_device(akm->input_dev);
++exit_input_dev_alloc_failed:
++	akm8975_power_off(akm);
++exit_power_on_failed:
++	kfree(akm);
++exit_alloc_data_failed:
++exit_check_functionality_failed:
++exit_platform_data_null:
++	return err;
++}
++
++static int __devexit akm8975_remove(struct i2c_client *client)
++{
++	struct akm8975_data *akm = i2c_get_clientdata(client);
++	FUNCDBG("called");
++	free_irq(client->irq, NULL);
++	input_unregister_device(akm->input_dev);
++	misc_deregister(&akmd_device);
++	misc_deregister(&akm_aot_device);
++	akm8975_power_off(akm);
++	kfree(akm);
++	return 0;
++}
++
++static const struct i2c_device_id akm8975_id[] = {
++	{ "akm8975", 0 },
++	{ }
++};
++
++MODULE_DEVICE_TABLE(i2c, akm8975_id);
++
++static struct i2c_driver akm8975_driver = {
++	.probe = akm8975_probe,
++	.remove = akm8975_remove,
++#ifndef CONFIG_HAS_EARLYSUSPEND
++	.resume = akm8975_resume,
++	.suspend = akm8975_suspend,
++#endif
++	.id_table = akm8975_id,
++	.driver = {
++		.name = "akm8975",
++	},
++};
++
++static int __init akm8975_init(void)
++{
++	pr_info("AK8975 compass driver: init\n");
++	FUNCDBG("AK8975 compass driver: init\n");
++	return i2c_add_driver(&akm8975_driver);
++}
++
++static void __exit akm8975_exit(void)
++{
++	FUNCDBG("AK8975 compass driver: exit\n");
++	i2c_del_driver(&akm8975_driver);
++}
++
++module_init(akm8975_init);
++module_exit(akm8975_exit);
++
++MODULE_AUTHOR("Hou-Kun Chen <hk_chen@htc.com>");
++MODULE_DESCRIPTION("AK8975 compass driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/pwm-sunxi.c b/drivers/misc/pwm-sunxi.c
+new file mode 100644
+index 0000000..19e0521
+--- /dev/null
++++ b/drivers/misc/pwm-sunxi.c
+@@ -0,0 +1,913 @@
++/* pwm-sunxi.c 
++ * 
++ * pwm module for sun4i (and others) like cubieboard and pcduino 
++ * 
++ * (C) Copyright 2013 
++ * David H. Wilkins  <dwil...@conecuh.com> 
++ * 
++ * CHANGELOG:
++ * 10.08.2013 - Stefan Voit <stefan.voit@voit-consulting.com>
++ * - Added script.bin support for [pwm0_para] and [pwm1_para]: pwm_used, pwm_period, pwm_duty_percent
++ * - Added initial setup based on script.bin settings
++ * - Removed bug that caused the PWM to pause quickly when changing parameters
++ * - Dropped debug/dump functions
++ *
++ * TODO:
++ * - Implement duty_percent=0 to set pwm line to 0 - right now it goes to 100%
++ * - Change the script_bin settings loader for pwm_period to allow text based values (100ms, 10hz,...)
++ * - Merge h & c file
++ * - 
++ *
++ * This program is free software; you can redistribute it and/or 
++ * modify it under the terms of the GNU General Public License as 
++ * published by the Free Software Foundation; either version 2 of 
++ * the License, or (at your option) any later version. 
++ * 
++ * This program is distributed in the hope that it will be useful, 
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of 
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.         See the 
++ * GNU General Public License for more details. 
++ * 
++ * You should have received a copy of the GNU General Public License 
++ * along with this program; if not, write to the Free Software 
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, 
++ * MA 02111-1307 USA 
++ */ 
++ 
++#include <asm/delay.h> 
++#include <asm/io.h> 
++#include <linux/ctype.h> 
++#include <linux/device.h> 
++#include <linux/err.h> 
++#include <linux/kdev_t.h> 
++#include <linux/kernel.h> 
++#include <linux/kobject.h> 
++#include <linux/limits.h> 
++#include <linux/module.h> 
++#include <linux/platform_device.h> 
++#include <linux/pwm.h> 
++#include <linux/pwm.h> 
++#include <linux/slab.h> 
++#include <linux/sysfs.h> 
++#include <mach/platform.h> 
++#include <plat/sys_config.h>
++#include <plat/system.h>
++#include "pwm-sunxi.h"
++/* 
++ * Forward Declarations 
++ */ 
++
++
++#define SUNXI_PWM_DEBUG
++
++//comment to get debug messages
++#undef SUNXI_PWM_DEBUG
++ 
++void release_pwm_sunxi(struct kobject *kobj); 
++void pwm_setup_available_channels(void ); 
++ssize_t pwm_set_mode(unsigned int enable, struct sun4i_pwm_available_channel *chan); 
++enum sun4i_pwm_prescale  pwm_get_best_prescale(unsigned long long period); 
++unsigned int get_entire_cycles(struct sun4i_pwm_available_channel *chan); 
++unsigned int get_active_cycles(struct sun4i_pwm_available_channel *chan); 
++unsigned long convert_string_to_microseconds(const char *buf); 
++int pwm_set_period_and_duty(struct sun4i_pwm_available_channel *chan); 
++void fixup_duty(struct sun4i_pwm_available_channel *chan); 
++ 
++ 
++static DEFINE_MUTEX(sysfs_lock); 
++static struct class pwm_class; 
++ 
++void *PWM_CTRL_REG_BASE = NULL; 
++ 
++ 
++static struct class_attribute pwm_class_attrs[] = { 
++	__ATTR_NULL 
++}; 
++ 
++ 
++static struct class pwm_class = { 
++	.name =         "pwm-sunxi", 
++	.owner =        THIS_MODULE, 
++	.class_attrs =  pwm_class_attrs, 
++}; 
++ 
++ 
++/* 
++ * sysfs store / show functions 
++ */ 
++ 
++static ssize_t pwm_polarity_show(struct device *dev, struct device_attribute *attr, char *buf); 
++static ssize_t pwm_period_show(struct device *dev, struct device_attribute *attr, char *buf); 
++static ssize_t pwm_duty_show(struct device *dev, struct device_attribute *attr, char *buf); 
++static ssize_t pwm_run_show(struct device *dev,struct device_attribute *attr, char *buf); 
++static ssize_t pwm_duty_percent_show(struct device *dev,struct device_attribute *attr, char *buf); 
++static ssize_t pwm_pulse_show(struct device *dev,struct device_attribute *attr, char *buf); 
++static ssize_t pwm_pin_show(struct device *dev,struct device_attribute *attr, char *buf); 
++ 
++static ssize_t pwm_polarity_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size); 
++static ssize_t pwm_period_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size); 
++static ssize_t pwm_duty_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size); 
++static ssize_t pwm_run_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size); 
++static ssize_t pwm_duty_percent_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size); 
++static ssize_t pwm_pulse_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size); 
++ 
++static DEVICE_ATTR(polarity, 0644,pwm_polarity_show, pwm_polarity_store); 
++static DEVICE_ATTR(period, 0644, pwm_period_show, pwm_period_store); 
++static DEVICE_ATTR(duty, 0644,pwm_duty_show, pwm_duty_store); 
++static DEVICE_ATTR(run, 0644, pwm_run_show, pwm_run_store); 
++static DEVICE_ATTR(duty_percent, 0644, pwm_duty_percent_show, pwm_duty_percent_store); 
++static DEVICE_ATTR(pulse, 0644, pwm_pulse_show, pwm_pulse_store); 
++static DEVICE_ATTR(pin, 0644, pwm_pin_show, NULL); 
++ 
++static const struct attribute *pwm_attrs[] = { 
++	&dev_attr_polarity.attr, 
++	&dev_attr_period.attr, 
++	&dev_attr_duty.attr, 
++	&dev_attr_run.attr, 
++	&dev_attr_duty_percent.attr, 
++	&dev_attr_pulse.attr, 
++	&dev_attr_pin.attr, 
++	NULL, 
++}; 
++ 
++static const struct attribute_group pwm_attr_group = { 
++	.attrs = (struct attribute **) pwm_attrs 
++}; 
++ 
++struct device *pwm0; 
++struct device *pwm1; 
++ 
++ 
++static struct sun4i_pwm_available_channel pwm_available_chan[SUN4I_MAX_HARDWARE_PWM_CHANNELS]; 
++static int sunxi_pwm_class_registered = 0;
++
++static void __init sunxi_pwm_register_class(void)
++{
++	if (sunxi_pwm_class_registered)
++		return;
++
++	if (class_register(&pwm_class) != 0) {
++		pr_err("pwm-sunxi: class_register failed\n");
++		return;
++	}
++	sunxi_pwm_class_registered = 1;
++}
++
++static int __init sunxi_pwm_init(void) 
++{ 
++	int init_enable, init_duty_percent, init_period;
++	struct sun4i_pwm_available_channel *chan;
++	int err = 0;
++
++	pwm_setup_available_channels(); 
++
++	//PWM 0
++	//printk("pwm-sunxi: configuring pwm0...\n");
++	chan = &pwm_available_chan[0];
++ 	
++	init_enable=0;
++	init_period=0;
++	init_duty_percent=100;
++
++	err = script_parser_fetch("pwm0_para", "pwm_used", &init_enable,sizeof(init_enable)/sizeof(int));
++	if (err == 0 && init_enable) {
++		sunxi_pwm_register_class();
++		pwm0 = device_create(&pwm_class, NULL,
++				MKDEV(0, 0), &pwm_available_chan[0], "pwm0");
++		err = sysfs_create_group(&pwm0->kobj, &pwm_attr_group);
++		if (err)
++			pr_err("pwm-sunxi: sysfs_create_group(pwm0) err %d\n",
++			       err);
++
++		err = script_parser_fetch("pwm0_para", "pwm_period", &init_period,sizeof(init_period)/sizeof(int));
++		if (err) {
++			pr_err("%s script_parser_fetch '[pwm0_para]' 'pwm_period' err - using 10000\n",	__func__);
++			init_period=10000;
++		}
++
++		err = script_parser_fetch("pwm0_para", "pwm_duty_percent", &init_duty_percent,sizeof(init_duty_percent)/sizeof(int));
++		if (err) {
++			pr_err("%s script_parser_fetch '[pwm0_para]' 'pwm_duty_percent' err - using 100\n",	__func__);
++			init_duty_percent=100;
++		}
++
++		chan->duty_percent=init_duty_percent;
++		chan->period = init_period; 
++		chan->prescale = pwm_get_best_prescale(init_period); 
++		fixup_duty(chan); 
++#ifdef SUNXI_PWM_DEBUG
++		printk("pwm-sunxi: pwm0 set initial values\n");
++#endif
++		pwm_set_mode(init_enable,chan); 
++		printk("pwm-sunxi: pwm0 configured - period: %ld, duty_percent: %d, duty: %ld\n",
++			chan->period, chan->duty_percent, chan->duty);
++	}
++
++	if (sunxi_is_sun5i()) /* Only 1 pwm on the A13 / A10s */
++		return 0;
++
++	//PWM 1
++	//printk("pwm-sunxi: configuring pwm1...\n");
++	chan = &pwm_available_chan[1];
++ 	
++	init_enable=0;
++	init_period=0;
++	init_duty_percent=100;
++
++	err = script_parser_fetch("pwm1_para", "pwm_used", &init_enable,sizeof(init_enable)/sizeof(int));
++	if (err == 0 && init_enable) {
++		sunxi_pwm_register_class();
++		pwm1 = device_create(&pwm_class, NULL,
++				MKDEV(0, 0), &pwm_available_chan[1], "pwm1");
++		err = sysfs_create_group(&pwm1->kobj, &pwm_attr_group);
++		if (err)
++			pr_err("pwm-sunxi: sysfs_create_group(pwm1) err %d\n",
++			       err);
++
++		err = script_parser_fetch("pwm1_para", "pwm_period", &init_period,sizeof(init_period)/sizeof(int));
++		if (err) {
++			pr_err("%s script_parser_fetch '[pwm1_para]' 'pwm_period' err - using 10000\n",	__func__);
++			init_period=10000;
++		}
++
++		err = script_parser_fetch("pwm1_para", "pwm_duty_percent", &init_duty_percent,sizeof(init_duty_percent)/sizeof(int));
++		if (err) {
++			pr_err("%s script_parser_fetch '[pwm1_para]' 'pwm_duty_percent' err - using 100\n",	__func__);
++			init_duty_percent=100;
++		}
++
++		chan->duty_percent=init_duty_percent;
++		chan->period = init_period; 
++		chan->prescale = pwm_get_best_prescale(init_period); 
++		fixup_duty(chan); 
++#ifdef SUNXI_PWM_DEBUG
++		printk("pwm-sunxi: pwm0 set initial values\n");
++#endif
++		pwm_set_mode(init_enable,chan); 
++		printk("pwm-sunxi: pwm1 configured - period: %ld, duty_percent: %d, duty: %ld\n",
++			chan->period, chan->duty_percent, chan->duty);
++	}
++	return 0;
++} 
++
++void sunxi_pwm_exit(void) 
++{ 
++	void *timer_base = ioremap(SW_PA_TIMERC_IO_BASE, 0x400); 
++	void *PWM_CTRL_REG_BASE = timer_base + 0x200; 
++
++	if (pwm0) {
++		device_destroy(&pwm_class, pwm0->devt);
++		writel(pwm_available_chan[0].pin_backup.initializer,
++		       pwm_available_chan[0].pin_addr);
++	}
++	if (pwm1) {
++		device_destroy(&pwm_class, pwm1->devt);
++		writel(pwm_available_chan[1].pin_backup.initializer,
++		       pwm_available_chan[1].pin_addr);
++	}
++
++	if (sunxi_pwm_class_registered) {
++		writel(0, PWM_CTRL_REG_BASE + 0); 
++		class_unregister(&pwm_class);
++	}
++}
++
++/* 
++ * Functions to display the pwm variables currently set 
++ */ 
++ 
++static ssize_t pwm_polarity_show(struct device *dev, struct device_attribute *attr, char *buf) { 
++	const struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status; 
++	switch (chan->channel) { 
++	case 0: 
++		status = scnprintf(buf,PAGE_SIZE,"%d",chan->ctrl_current.s.ch0_act_state); 
++		break; 
++	case 1: 
++		status = scnprintf(buf,PAGE_SIZE,"%d",chan->ctrl_current.s.ch1_act_state); 
++		break; 
++	default: 
++		status = -EINVAL; 
++		break; 
++	} 
++	return status; 
++} 
++static ssize_t pwm_period_show(struct device *dev, struct device_attribute *attr, char *buf) { 
++	const struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status; 
++	status = sprintf(buf,"%lu",chan->period); 
++	return status; 
++} 
++static ssize_t pwm_duty_show(struct device *dev, struct device_attribute *attr, char *buf) { 
++	const struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status; 
++	status = sprintf(buf,"%lu",chan->duty); 
++	return status; 
++} 
++static ssize_t pwm_run_show(struct device *dev,struct device_attribute *attr, char *buf) { 
++	const struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status; 
++	switch (chan->channel) { 
++	case 0: 
++		status = sprintf(buf,"%d",chan->ctrl_current.s.ch0_en); 
++		break; 
++	case 1: 
++		status = sprintf(buf,"%d",chan->ctrl_current.s.ch1_en); 
++		break; 
++	default: 
++		status = -EINVAL; 
++		break; 
++	} 
++ 
++	return status; 
++} 
++static ssize_t pwm_duty_percent_show(struct device *dev,struct device_attribute *attr, char *buf) { 
++	const struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	return sprintf(buf,"%u",chan->duty_percent); 
++} 
++static ssize_t pwm_pulse_show(struct device *dev,struct device_attribute *attr, char *buf) { 
++	const struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status; 
++	switch (chan->channel) { 
++	case 0: 
++		status = sprintf(buf,"%d",chan->ctrl_current.s.ch0_pulse_start); 
++		break; 
++	case 1: 
++		status = sprintf(buf,"%d",chan->ctrl_current.s.ch1_pulse_start); 
++		break; 
++	default: 
++		status = -EINVAL; 
++		break; 
++	} 
++	return status; 
++} 
++ 
++static ssize_t pwm_pin_show(struct device *dev,struct device_attribute *attr, char *buf) { 
++	const struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status; 
++	status = sprintf(buf,"%s",chan->pin_name); 
++ 
++	return status; 
++} 
++ 
++/* 
++ * Functions to store values for pwm 
++ */ 
++ 
++static ssize_t pwm_polarity_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size) { 
++	struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status = -EINVAL; 
++	int act_state = 0; 
++ 
++	sscanf(buf,"%d",&act_state); 
++	if(act_state < 2) { 
++		switch (chan->channel) { 
++		case 0: 
++			chan->ctrl_current.s.ch0_act_state = act_state; 
++			break; 
++		case 1: 
++			chan->ctrl_current.s.ch1_act_state = act_state; 
++			break; 
++		default: 
++			status = -EINVAL; 
++			break; 
++		} 
++		status = size; 
++	} 
++	return status; 
++} 
++static ssize_t pwm_period_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size) { 
++	unsigned long long period = 0; 
++	struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++ 
++	period = convert_string_to_microseconds(buf); 
++	if(!period || period > ULONG_MAX) { 
++		size = -EINVAL; 
++	} else { 
++		if(period <= chan->duty) { 
++			chan->duty = period; 
++		} 
++		chan->period = period; 
++		chan->prescale = pwm_get_best_prescale(period); 
++		fixup_duty(chan); 
++		if(chan->duty) { 
++			pwm_set_mode(NO_ENABLE_CHANGE,chan); 
++		} 
++	} 
++	return size; 
++} 
++static ssize_t pwm_duty_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size) { 
++	unsigned long long duty = 0; 
++	struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++ 
++	/* sscanf(buf,"%Lu",&duty); */ /* L means long long pointer */ 
++	duty = convert_string_to_microseconds(buf); 
++	duty = duty > ULONG_MAX ? ULONG_MAX : duty; 
++	duty = duty > chan->period ? chan->period : duty; 
++	chan->duty_percent = -1; /* disable duty_percent if duty is set by hand */ 
++	chan->duty = duty; 
++	pwm_set_mode(NO_ENABLE_CHANGE,chan); 
++	return size; 
++} 
++ 
++struct time_suffix suffixes[] = { 
++	[0] = { .suffix = "hz",  .multiplier =	  1, .freq = true  }, /* f = 1/T */ 
++	[1] = { .suffix = "khz", .multiplier =       1000, .freq = true  }, 
++	[2] = { .suffix = "mhz", .multiplier =    1000000, .freq = true  }, 
++	[3] = { .suffix = "ghz", .multiplier = 1000000000, .freq = true  }, 
++	[4] = { .suffix = "ms",  .multiplier =       1000, .freq = false }, /* T = 1/f */ 
++	[5] = { .suffix = "us",  .multiplier =	  1, .freq = false }, 
++	[6] = { .suffix = "ns",  .multiplier =	  1, .freq = false }, 
++	[7] = { .suffix = NULL,  .multiplier =	  0, .freq = false }, 
++}; 
++ 
++ 
++unsigned long convert_string_to_microseconds(const char *buf) { 
++	unsigned char ch = 0; 
++	char numbers[10]; 
++	char letters[4]; 
++	const char *bufptr = buf; 
++	int i = 0; 
++	unsigned long microseconds = 0; 
++	unsigned long numeric_part = 0; 
++	int found_suffix = -1; 
++	int numbers_index = 0, letters_index = 0; 
++	while(bufptr && *bufptr && (ch = *bufptr)  && isdigit(ch) && numbers_index < (sizeof(numbers)-1)) { 
++		numbers[numbers_index++] = *bufptr++; 
++	} 
++	numbers[numbers_index] = 0; 
++	while(bufptr && *bufptr && (ch = *bufptr)  && strchr("usmhznhzkg",tolower(ch)) && letters_index < (sizeof(letters)-1)) { 
++		letters[letters_index++] = tolower(*bufptr); 
++		bufptr++; 
++	} 
++	letters[letters_index] = 0; 
++	sscanf(numbers,"%lu",&numeric_part); 
++	while(suffixes[i].suffix) { 
++		if(!strcmp(suffixes[i].suffix,letters)) { 
++			found_suffix = i; 
++			break; 
++		} 
++		i++; 
++	} 
++	if(found_suffix > -1) { 
++		if(suffixes[found_suffix].freq) { 
++			microseconds = 1000000 / (numeric_part * suffixes[found_suffix].multiplier); 
++		} else { 
++			microseconds = suffixes[found_suffix].multiplier * numeric_part; 
++		} 
++	} 
++	return microseconds; 
++} 
++ 
++ 
++ 
++ 
++static const unsigned int prescale_divisor[13] = {120, 
++						  180, 
++						  240, 
++						  360, 
++						  480, 
++						  480, /* Invalid Option */ 
++						  480, /* Invalid Option */ 
++						  480, /* Invalid Option */ 
++						  12000, 
++						  24000, 
++						  36000, 
++						  48000, 
++						  72000}; 
++ 
++/* 
++ * Find the best prescale value for the period 
++ * We want to get the highest period cycle count possible, so we look 
++ * make a run through the prescale values looking for numbers over 
++ * min_optimal_period_cycles.  If none are found then root though again 
++ * taking anything that works 
++ */ 
++enum sun4i_pwm_prescale  pwm_get_best_prescale(unsigned long long period_in) { 
++	int i; 
++	unsigned long period = period_in; 
++	const unsigned long min_optimal_period_cycles = MAX_CYCLES / 2; 
++	const unsigned long min_period_cycles = 0x02; 
++	enum sun4i_pwm_prescale best_prescale = 0; 
++ 
++	best_prescale = -1; 
++	for(i = 0 ; i < 13 ; i++) { 
++		unsigned long int check_value = (prescale_divisor[i] /24); 
++		if(check_value < 1 || check_value > period) { 
++			break; 
++		} 
++		if(((period / check_value) >= min_optimal_period_cycles) && 
++			((period / check_value) <= MAX_CYCLES)) { 
++			best_prescale = i; 
++			break; 
++		} 
++	} 
++ 
++	if(best_prescale > 13) { 
++		for(i = 0 ; i < 13 ; i++) { 
++			unsigned long int check_value = (prescale_divisor[i] /24); 
++			if(check_value < 1 || check_value > period) { 
++				break; 
++			} 
++			if(((period / check_value) >= min_period_cycles) && 
++				((period / check_value) <= MAX_CYCLES)) { 
++				best_prescale = i; 
++				break; 
++			} 
++		} 
++	} 
++	if(best_prescale > 13) { 
++		best_prescale = PRESCALE_DIV480;  /* Something that's not zero - use invalid prescale value */ 
++	} 
++ 
++	return best_prescale; 
++} 
++ 
++/* 
++ * return the number of cycles for the channel period computed from the microseconds 
++ * for the period.  Allwinner docs call this "entire" cycles 
++ */ 
++unsigned int get_entire_cycles(struct sun4i_pwm_available_channel *chan) { 
++	unsigned int entire_cycles = 0x01; 
++	if ((2 * prescale_divisor[chan->prescale] * MAX_CYCLES) > 0) { 
++		entire_cycles = chan->period / (prescale_divisor[chan->prescale] /24); 
++	} 
++	if(entire_cycles == 0) {entire_cycles = MAX_CYCLES;} 
++	if(entire_cycles > MAX_CYCLES) {entire_cycles = MAX_CYCLES;} 
++#ifdef SUNXI_PWM_DEBUG
++	printk("Best prescale was %d, entire cycles was %u\n",chan->prescale, entire_cycles); 
++#endif
++ 
++	return entire_cycles; 
++} 
++ 
++/* 
++ * return the number of cycles for the channel duty computed from the microseconds 
++ * for the duty.  Allwinner docs call this "active" cycles 
++ */ 
++unsigned int get_active_cycles(struct sun4i_pwm_available_channel *chan) { 
++	unsigned int active_cycles = 0x01; 
++	unsigned int entire_cycles = get_entire_cycles(chan); 
++	if(chan->duty < 0 && chan->period) { 
++       		active_cycles = entire_cycles-1; 
++	} else if ((2 * prescale_divisor[chan->prescale] * MAX_CYCLES) > 0) { 
++		active_cycles = chan->duty / (prescale_divisor[chan->prescale] /24); 
++	} 
++/*	if(active_cycles == 0) {active_cycles = 0x0ff;} */ 
++#ifdef SUNXI_PWM_DEBUG
++	printk("Best prescale was %d, active cycles was %u (before entire check)\n",chan->prescale, active_cycles); 
++#endif
++	if(active_cycles > MAX_CYCLES) {active_cycles = entire_cycles-1;} 
++#ifdef SUNXI_PWM_DEBUG
++	printk("Best prescale was %d, active cycles was %u (after  entire check)\n",chan->prescale, active_cycles); 
++#endif
++	return active_cycles; 
++} 
++ 
++/* 
++ * When the duty is set, compute the number of microseconds 
++ * based on the period. 
++ */ 
++ 
++void fixup_duty(struct sun4i_pwm_available_channel *chan) { 
++	if(chan->duty_percent >= 0) { 
++		chan->duty = chan->period * chan->duty_percent / 100; 
++	} 
++} 
++ 
++/* 
++ * Stores the run (enable) bit. 
++ */ 
++ 
++static ssize_t pwm_run_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size) { 
++	struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status = -EINVAL; 
++	int enable = 0; 
++ 
++	sscanf(buf,"%d",&enable); 
++	if(enable < 2) { 
++		status = pwm_set_mode(enable, chan); 
++	} 
++	return size; 
++} 
++ 
++static ssize_t pwm_duty_percent_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size) { 
++	unsigned int duty_percent = 0; 
++	struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++ 
++	sscanf(buf,"%u",&duty_percent); 
++	if(duty_percent > 100) { 
++		size = -EINVAL; 
++	} else { 
++		chan->duty_percent = duty_percent; 
++		if(chan->period) { 
++			fixup_duty(chan); 
++			pwm_set_mode(NO_ENABLE_CHANGE,chan); 
++		} 
++	} 
++ 
++	return size; 
++} 
++static ssize_t pwm_pulse_store(struct device *dev,struct device_attribute *attr, const char *buf, size_t size) { 
++	struct sun4i_pwm_available_channel *chan = dev_get_drvdata(dev); 
++	ssize_t status = -EINVAL; 
++	int pulse = 0; 
++	sscanf(buf,"%d",&pulse); 
++	if(pulse < 2) { 
++		switch (chan->channel) { 
++		case 0: 
++			chan->ctrl_current.s.ch0_pulse_start = pulse; 
++			break; 
++		case 1: 
++			chan->ctrl_current.s.ch1_pulse_start = pulse; 
++			break; 
++		default: 
++			status = -EINVAL; 
++			break; 
++		} 
++		status = size; 
++	} 
++	return status; 
++} 
++ 
++int pwm_set_period_and_duty(struct sun4i_pwm_available_channel *chan) { 
++	int return_val = -EINVAL; 
++	unsigned int entire_cycles = get_entire_cycles(chan); 
++	unsigned int active_cycles = get_active_cycles(chan); 
++	chan->period_reg.initializer = 0; 
++	if(entire_cycles >= active_cycles && active_cycles) { 
++		chan->period_reg.s.pwm_entire_cycles = entire_cycles; 
++		chan->period_reg.s.pwm_active_cycles = active_cycles; 
++	} else { 
++		chan->period_reg.s.pwm_entire_cycles = MAX_CYCLES; 
++		chan->period_reg.s.pwm_active_cycles = MAX_CYCLES; 
++	} 
++	writel(chan->period_reg.initializer, chan->period_reg_addr); 
++	return return_val; 
++} 
++ 
++ 
++ssize_t pwm_set_mode(unsigned int enable, struct sun4i_pwm_available_channel *chan) { 
++	ssize_t status = 0; 
++	if(enable == NO_ENABLE_CHANGE) { 
++		switch (chan->channel) { 
++		case 0: 
++			enable = chan->ctrl_current.s.ch0_en; 
++			break; 
++		case 1: 
++			enable = chan->ctrl_current.s.ch1_en; 
++			break; 
++		default: 
++			status = -EINVAL; 
++			break; 
++		} 
++	} 
++	chan->ctrl_current.initializer = readl(chan->ctrl_addr); 
++	if(enable == 1) { 
++		switch (chan->channel) { 
++		case 0: 
++			chan->ctrl_current.s.ch0_prescaler = 0; 
++			chan->ctrl_current.s.ch0_act_state = 0; 
++			chan->ctrl_current.s.ch0_mode = 0; 
++			chan->ctrl_current.s.ch0_pulse_start = 0; 
++			chan->ctrl_current.s.ch0_en = 0; 
++			chan->ctrl_current.s.ch0_clk_gating = 0; 
++			break; 
++		case 1: 
++			chan->ctrl_current.s.ch1_prescaler = 0; 
++			chan->ctrl_current.s.ch1_act_state = 0; 
++			chan->ctrl_current.s.ch1_mode = 0; 
++			chan->ctrl_current.s.ch1_pulse_start = 0; 
++			chan->ctrl_current.s.ch1_en = 1; 
++			chan->ctrl_current.s.ch1_clk_gating = 0; 
++			break; 
++		default: 
++			status = -EINVAL; 
++			break; 
++		} 
++		if(status) { 
++			return status; 
++		} 
++		//writel(chan->ctrl_current.initializer,chan->ctrl_addr); 
++		chan->pin_current.initializer = readl(chan->pin_addr); 
++		if(chan->pin_mask.s0.pin0_select) { 
++			chan->pin_current.s0.pin0_select = SELECT_PWM; 
++		} 
++		if(chan->pin_mask.s0.pin1_select) { 
++			chan->pin_current.s0.pin1_select = SELECT_PWM; 
++		} 
++		if(chan->pin_mask.s0.pin2_select) { 
++			chan->pin_current.s0.pin2_select = SELECT_PWM; 
++		} 
++		if(chan->pin_mask.s0.pin3_select) { 
++			chan->pin_current.s0.pin3_select = SELECT_PWM; 
++		} 
++		if(chan->pin_mask.s0.pin4_select) { 
++			chan->pin_current.s0.pin4_select = SELECT_PWM; 
++		} 
++		if(chan->pin_mask.s0.pin5_select) { 
++			chan->pin_current.s0.pin5_select = SELECT_PWM; 
++		} 
++		if(chan->pin_mask.s0.pin6_select) { 
++			chan->pin_current.s0.pin6_select = SELECT_PWM; 
++		} 
++		if(chan->pin_mask.s0.pin7_select) { 
++			chan->pin_current.s0.pin7_select = SELECT_PWM; 
++		} 
++		if(chan->channel == 0) { 
++			chan->ctrl_current.s.ch0_prescaler = chan->prescale; 
++		} else { 
++			chan->ctrl_current.s.ch1_prescaler = chan->prescale; 
++		} 
++		pwm_set_period_and_duty(chan); 
++ 
++		writel(chan->pin_current.initializer,chan->pin_addr); 
++		//writel(chan->ctrl_current.initializer,chan->ctrl_addr); 
++		switch (chan->channel) { 
++		case 0: 
++			chan->ctrl_current.s.ch0_en = 1; 
++			chan->ctrl_current.s.ch0_clk_gating = 1; 
++			break; 
++		case 1: 
++			chan->ctrl_current.s.ch1_en = 1; 
++			chan->ctrl_current.s.ch1_clk_gating = 1; 
++			break; 
++		} 
++		writel(chan->ctrl_current.initializer,chan->ctrl_addr); 
++ 
++	} else if (enable == 0) { 
++		switch (chan->channel) { 
++		case 0: 
++			chan->ctrl_current.s.ch0_clk_gating = 0; 
++			chan->ctrl_current.s.ch0_en = enable; 
++			break; 
++		case 1: 
++			chan->ctrl_current.s.ch1_clk_gating = 0; 
++			chan->ctrl_current.s.ch1_en = enable; 
++			break; 
++		default: 
++			status = -EINVAL; 
++			break; 
++		} 
++		if(!status) { 
++			chan->pin_current.initializer &= ~chan->pin_mask.initializer; 
++			chan->pin_current.initializer |= readl(chan->pin_addr) & chan->pin_mask.initializer; 
++			writel(chan->pin_current.initializer,chan->pin_addr); 
++			writel(chan->ctrl_current.initializer,chan->ctrl_addr); 
++		} 
++	} 
++	return status; 
++} 
++ 
++ 
++ 
++void pwm_setup_available_channels( void ) { 
++	void * timer_base = ioremap(SW_PA_TIMERC_IO_BASE, 0x400);  /* 0x01c20c00 */ 
++	void * PWM_CTRL_REG_BASE = timer_base + 0x200;	     /* 0x01c20e00 */ 
++	void * portc_io_base = ioremap(SW_PA_PORTC_IO_BASE,0x400); /* 0x01c20800 */ 
++	void * PB_CFG0_REG = (portc_io_base + 0x24);	       /* 0x01C20824 */ 
++	void * PI_CFG0_REG = (portc_io_base + 0x120);	      /* 0x01c20920 */ 
++ 
++	/*void * PB_PULL0_REG = (portc_io_base + 0x040);*/	     /* 0x01c20840 */ 
++	/*void * PI_PULL0_REG = (portc_io_base + 0x13c);*/	     /* 0x01c2091c */ 
++	/*void * PH_CFG0_REG = (portc_io_base + 0xfc);*/	       /* 0x01c208fc */ 
++	/*void * PH_CFG1_REG = (portc_io_base + 0x100);*/	      /* 0x01c20900 */ 
++	/*void * PH_PULL0_REG = (portc_io_base + 0x118);*/	     /* 0x01c20918 */ 
++ 
++	pwm_available_chan[0].use_count = 0; 
++	pwm_available_chan[0].ctrl_addr = PWM_CTRL_REG_BASE; 
++	pwm_available_chan[0].pin_addr = PB_CFG0_REG; 
++	pwm_available_chan[0].period_reg_addr = pwm_available_chan[0].ctrl_addr + 0x04; 
++	pwm_available_chan[0].channel = 0; 
++	pwm_available_chan[0].ctrl_backup.initializer = readl(pwm_available_chan[0].ctrl_addr); 
++	pwm_available_chan[0].ctrl_mask.initializer = 0; 
++	pwm_available_chan[0].ctrl_mask.s.ch0_prescaler = 0x0f; 
++	pwm_available_chan[0].ctrl_mask.s.ch0_en = 0x01; 
++	pwm_available_chan[0].ctrl_mask.s.ch0_act_state = 0x01; 
++	pwm_available_chan[0].ctrl_mask.s.ch0_clk_gating = 0x00; 
++	pwm_available_chan[0].ctrl_mask.s.ch0_mode = 0x01; 
++	pwm_available_chan[0].ctrl_mask.s.ch0_pulse_start = 0x01; 
++	pwm_available_chan[0].ctrl_current.initializer = 0; 
++	pwm_available_chan[0].pin_backup.initializer = readl(pwm_available_chan[0].pin_addr); 
++/*	pwm_available_chan[0].pin_mask.initializer = 0xffffffff; */ 
++	pwm_available_chan[0].pin_mask.s0.pin2_select = 0x07; 
++	pwm_available_chan[0].pin_current.s0.pin2_select = 0x02; 
++ 
++	pwm_available_chan[0].pin_name = "PB2"; 
++	pwm_available_chan[0].period = 10000; 
++	pwm_available_chan[0].duty_percent = 100; 
++	*(unsigned int *)&pwm_available_chan[0].period_reg = 0; 
++	pwm_available_chan[0].prescale = 0; 
++ 
++ 
++	pwm_available_chan[1].use_count = 0; 
++	pwm_available_chan[1].ctrl_addr = PWM_CTRL_REG_BASE; 
++	pwm_available_chan[1].pin_addr = PI_CFG0_REG; 
++	pwm_available_chan[1].period_reg_addr = pwm_available_chan[1].ctrl_addr + 0x08; 
++	pwm_available_chan[1].channel = 1; 
++	pwm_available_chan[1].ctrl_backup.initializer = readl(pwm_available_chan[1].ctrl_addr); 
++	pwm_available_chan[1].ctrl_mask.initializer = 0; 
++	pwm_available_chan[1].ctrl_mask.s.ch1_prescaler = 0x0f; 
++	pwm_available_chan[1].ctrl_mask.s.ch1_en = 0x01; 
++	pwm_available_chan[1].ctrl_mask.s.ch1_act_state = 0x01; 
++	pwm_available_chan[1].ctrl_mask.s.ch1_clk_gating = 0x00; 
++	pwm_available_chan[1].ctrl_mask.s.ch1_mode = 0x01; 
++	pwm_available_chan[1].ctrl_mask.s.ch1_pulse_start = 0x01; 
++	pwm_available_chan[1].ctrl_current.initializer = 0; 
++	pwm_available_chan[1].pin_backup.initializer = readl(pwm_available_chan[1].pin_addr); 
++	pwm_available_chan[1].pin_mask.initializer = 0; 
++	pwm_available_chan[1].pin_mask.s0.pin3_select = 0x07; 
++	pwm_available_chan[1].pin_current.s0.pin3_select = 0x02; 
++	pwm_available_chan[1].pin_name = "PI3"; 
++	pwm_available_chan[1].period = 10000; 
++	pwm_available_chan[1].duty_percent = 50; 
++	*(unsigned int *)&pwm_available_chan[1].period_reg = 0; 
++	pwm_available_chan[1].prescale = 0; 
++ 
++ 
++} 
++ 
++struct pwm_device { 
++	struct sun4i_pwm_available_channel *chan; 
++}; 
++ 
++struct pwm_device pwm_devices[2] = { 
++	[0] = {.chan = &pwm_available_chan[0]}, 
++	[1] = {.chan = &pwm_available_chan[1]} 
++}; 
++ 
++struct pwm_device *pwm_request(int pwm_id, const char *label) 
++{ 
++	struct pwm_device *pwm; 
++	int found = 0; 
++ 
++	if(pwm_id < 2 && pwm_id >= 0) { 
++		pwm = &pwm_devices[pwm_id]; 
++		found = 1; 
++	} 
++	if (found) { 
++		if (pwm->chan->use_count == 0) { 
++			pwm->chan->use_count++; 
++			pwm->chan->name = label; 
++		} else 
++			pwm = ERR_PTR(-EBUSY); 
++	} else 
++		pwm = ERR_PTR(-ENOENT); 
++ 
++	return pwm; 
++} 
++EXPORT_SYMBOL(pwm_request); 
++ 
++ 
++int pwm_config(struct pwm_device *pwm, int duty_ns, int period_ns) 
++{ 
++	if (pwm == NULL || period_ns == 0 || duty_ns > period_ns) 
++		return -EINVAL; 
++ 
++	pwm->chan->period = period_ns / 1000; 
++	pwm->chan->prescale = pwm_get_best_prescale(pwm->chan->period); 
++	pwm->chan->duty = duty_ns / 1000; 
++	fixup_duty(pwm->chan); 
++	pwm_set_mode(NO_ENABLE_CHANGE,pwm->chan); 
++	return 0; 
++} 
++EXPORT_SYMBOL(pwm_config); 
++ 
++ 
++int pwm_enable(struct pwm_device *pwm) 
++{ 
++	if (pwm == NULL) { 
++		return -EINVAL; 
++	} 
++	pwm_set_mode(PWM_CTRL_ENABLE,pwm->chan); 
++	return 0; 
++} 
++EXPORT_SYMBOL(pwm_enable); 
++ 
++void pwm_disable(struct pwm_device *pwm) 
++{ 
++	if (pwm == NULL) { 
++		return; 
++	} 
++	pwm_set_mode(PWM_CTRL_DISABLE,pwm->chan); 
++} 
++EXPORT_SYMBOL(pwm_disable); 
++ 
++void pwm_free(struct pwm_device *pwm) 
++{ 
++	if (pwm->chan->use_count) { 
++		pwm->chan->use_count--; 
++	} else 
++		pr_warning("PWM device already freed\n"); 
++} 
++EXPORT_SYMBOL(pwm_free); 
++ 
++ 
++module_init(sunxi_pwm_init); 
++module_exit(sunxi_pwm_exit); 
++ 
++ 
++ 
++ 
++MODULE_LICENSE("GPL"); 
++MODULE_AUTHOR("David H. Wilkins <dwil...@conecuh.com>"); 
+diff --git a/drivers/misc/pwm-sunxi.h b/drivers/misc/pwm-sunxi.h
+new file mode 100644
+index 0000000..b712b7a
+--- /dev/null
++++ b/drivers/misc/pwm-sunxi.h
+@@ -0,0 +1,198 @@
++/* 
++ * pwm-sunxi.h 
++ * 
++ * (C) Copyright 2013 
++ * David H. Wilkins  <dwil...@conecuh.com> 
++ * 
++ * This program is free software; you can redistribute it and/or 
++ * modify it under the terms of the GNU General Public License as 
++ * published by the Free Software Foundation; either version 2 of 
++ * the License, or (at your option) any later version. 
++ * 
++ * This program is distributed in the hope that it will be useful, 
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of 
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.         See the 
++ * GNU General Public License for more details. 
++ * 
++ * You should have received a copy of the GNU General Public License 
++ * along with this program; if not, write to the Free Software 
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, 
++ * MA 02111-1307 USA 
++ */ 
++ 
++ 
++#define SUN4I_PWM_IOREG_MAX 10 
++#define SUN4I_MAX_HARDWARE_PWM_CHANNELS 2 
++ 
++/* 
++ * structure that defines the pwm control register 
++ */ 
++ 
++enum sun4i_pwm_prescale { 
++	PRESCALE_DIV120  = 0x00,  /* Divide 24mhz clock by 120 */ 
++	PRESCALE_DIV180  = 0x01, 
++	PRESCALE_DIV240  = 0x02, 
++	PRESCALE_DIV360  = 0x03, 
++	PRESCALE_DIV480  = 0x04, 
++	PRESCALE_INVx05  = 0x05, 
++	PRESCALE_INVx06  = 0x06, 
++	PRESCALE_INVx07  = 0x07, 
++	PRESCALE_DIV12k  = 0x08, 
++	PRESCALE_DIV24k  = 0x09, 
++	PRESCALE_DIV36k  = 0x0a, 
++	PRESCALE_DIV48k  = 0x0b, 
++	PRESCALE_DIV72k  = 0x0c 
++}; 
++ 
++ 
++ 
++ 
++struct sun4i_pwm_ctrl { 
++	enum sun4i_pwm_prescale ch0_prescaler:4; /* ch0 Prescale register - values above */ 
++	unsigned int ch0_en:1;                  /* chan 0 enable */ 
++	unsigned int ch0_act_state:1;           /* chan 0 polarity 0=low, 1=high */ 
++	unsigned int ch0_clk_gating:1;          /* Allow clock to run for chan 0 */ 
++	unsigned int ch0_mode:1;                /* Mode - 0 = cycle(running), 1=only 1 pulse */ 
++	unsigned int ch0_pulse_start:1;         /* Write 1 for mode pulse above to start */ 
++	unsigned int unused1:6;                 /* The bit skip count is 6 */ 
++	enum sun4i_pwm_prescale ch1_prescaler:4; /* ch1 Prescale register - values above*/ 
++	unsigned int ch1_en:1;                  /* chan 1 enable */ 
++	unsigned int ch1_act_state:1;           /* chan 1 polarity 0=low, 1=high */ 
++	unsigned int ch1_clk_gating:1;          /* Allow clock to run for chan 1 */ 
++	unsigned int ch1_mode:1;                /* Mode - 0 = cycle(running), 1=only 1 pulse */ 
++	unsigned int ch1_pulse_start:1;         /* Write 1 for mode pulse above to start */ 
++	unsigned int unused2:6;                 /* The bit skip count is 6 */ 
++}; 
++ 
++ 
++#define A10CLK 24000000  /* Speed of the clock - 24mhz */ 
++ 
++#define NO_ENABLE_CHANGE 2  /* Signal to set_pwm_mode to keep the same chan enable bit */ 
++ 
++#define PWM_CTRL_ENABLE 1 
++#define PWM_CTRL_DISABLE 0 
++ 
++#define MAX_CYCLES 0x0ffff /* max cycle count possible for period active and entire */ 
++struct sun4i_pwm_period { 
++#if MAX_CYCLES > 0x0ff 
++	unsigned int pwm_active_cycles:16;        /* duty cycle */ 
++	unsigned int pwm_entire_cycles:16;        /* period */ 
++#else 
++	unsigned int pwm_active_cycles:8;        /* duty cycle */ 
++	unsigned int unused1:8; 
++	unsigned int pwm_entire_cycles:8;        /* period */ 
++	unsigned int unused2:8; 
++#endif 
++}; 
++ 
++ 
++enum sun4i_ioreg_pin_select { 
++	SELECT_INPUT      = 0x00,                /* bits for the config registers */ 
++	SELECT_OUTPUT     = 0x01, 
++	SELECT_PWM        = 0x02, 
++	SELECT_SPI2_CLK   = 0x02, 
++	SELECT_I2S_LRCK   = 0x02, 
++	SELECT_I2S_BCLK   = 0x02 
++}; 
++ 
++ 
++struct sun4i_ioreg_cfg0 { 
++	enum sun4i_ioreg_pin_select pin0_select:4; 
++	enum sun4i_ioreg_pin_select pin1_select:4; 
++	enum sun4i_ioreg_pin_select pin2_select:4; 
++	enum sun4i_ioreg_pin_select pin3_select:4; 
++	enum sun4i_ioreg_pin_select pin4_select:4; 
++	enum sun4i_ioreg_pin_select pin5_select:4; 
++	enum sun4i_ioreg_pin_select pin6_select:4; 
++	enum sun4i_ioreg_pin_select pin7_select:4; 
++}; 
++ 
++/* 
++ * another duplicate struct to make the pin names 
++ * look right 
++ */ 
++struct sun4i_ioreg_cfg1 { 
++	enum  sun4i_ioreg_pin_select pin8_select:4; 
++	enum  sun4i_ioreg_pin_select pin9_select:4; 
++	enum  sun4i_ioreg_pin_select pin10_select:4; 
++	enum  sun4i_ioreg_pin_select pin11_select:4; 
++	enum  sun4i_ioreg_pin_select pin12_select:4; 
++	enum  sun4i_ioreg_pin_select pin13_select:4; 
++	enum  sun4i_ioreg_pin_select pin14_select:4; 
++	enum  sun4i_ioreg_pin_select pin15_select:4; 
++}; 
++ 
++ 
++struct ioreg_pull { 
++	unsigned int pin0:2; 
++	unsigned int pin1:2; 
++	unsigned int pin2:2; 
++	unsigned int pin3:2; 
++	unsigned int pin4:2; 
++	unsigned int pin5:2; 
++	unsigned int pin6:2; 
++	unsigned int pin7:2; 
++	unsigned int pin8:2; 
++	unsigned int pin9:2; 
++	unsigned int pin10:2; 
++	unsigned int pin11:2; 
++	unsigned int pin12:2; 
++	unsigned int pin13:2; 
++	unsigned int pin14:2; 
++	unsigned int pin15:2; 
++}; 
++ 
++union ioreg_pull_u { 
++	struct ioreg_pull s; 
++	unsigned int initializer; 
++}; 
++ 
++ 
++union sun4i_pwm_ctrl_u { 
++	struct sun4i_pwm_ctrl s; 
++	unsigned int initializer; 
++}; 
++ 
++union sun4i_pwm_period_u { 
++	struct sun4i_pwm_period s; 
++	unsigned int initializer; 
++}; 
++ 
++union sun4i_ioreg_cfg_u { 
++	struct sun4i_ioreg_cfg0 s0; /* io register config 0 */ 
++	struct sun4i_ioreg_cfg1 s1; /* io register config 1 (just to make pin names look nice) */ 
++	unsigned int initializer; 
++}; 
++ 
++ 
++ 
++struct sun4i_pwm_available_channel{ 
++	unsigned int use_count; 
++	void *ctrl_addr;                           /* Address of the control register */ 
++	void *pin_addr;                            /* Address of the pin register to change to PWM mode */ 
++	void *period_reg_addr;                     /* Address of the period register for this chan */ 
++	unsigned int channel;                      /* Channel number */ 
++	unsigned long period;                      /* Period in microseconds */ 
++	unsigned long duty;                        /* duty cycle in microseconds */ 
++	unsigned int duty_percent;                 /* percentage (drives duty microseconds if set) */ 
++	enum sun4i_pwm_prescale prescale;           /* best prescale value computed for period */ 
++	union sun4i_pwm_period_u period_reg;       /* period register */ 
++	union sun4i_pwm_ctrl_u ctrl_backup;        /* control register backup at init */ 
++	union sun4i_pwm_ctrl_u ctrl_mask;          /* mask for ctrl register bit we can change */ 
++	union sun4i_pwm_ctrl_u ctrl_current;       /* current control register settings */ 
++	union sun4i_ioreg_cfg_u pin_backup;        /* pin backup at init */ 
++	union sun4i_ioreg_cfg_u pin_mask;          /* mask of pin settings we can change */ 
++	union sun4i_ioreg_cfg_u pin_current;       /* current pin register */ 
++	const char *pin_name;                      /* name of the pin */ 
++	const char *name;                          /* name of the pwm device from the pwm i/f */ 
++}; 
++ 
++/* 
++ * struct used to implement the hz/khz/ms/us etc for period and duty 
++ */ 
++struct time_suffix { 
++	char * suffix;                             /* text suffix */ 
++	unsigned long multiplier;                  /* multiplier for the entered value */ 
++	bool freq;                                 /* true if a frequency, otherwise a time */ 
++	                                           /* T = 1/f and f = 1/T */ 
++};
+diff --git a/drivers/misc/sun4i-gpio.c b/drivers/misc/sun4i-gpio.c
+new file mode 100644
+index 0000000..1fb3549
+--- /dev/null
++++ b/drivers/misc/sun4i-gpio.c
+@@ -0,0 +1,270 @@
++/* driver/misc/sun4i-gpio.c
++ *
++ *  Copyright (C) 2011 Allwinner Technology Co.Ltd
++ *   Tom Cubie <tangliang@allwinnertech.com>
++ *
++ *  www.allwinnertech.com
++ *
++ *  An ugly sun4i gpio driver
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/pm.h>
++#include <linux/fs.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#ifdef CONFIG_HAS_EARLYSUSPEND
++#include <linux/earlysuspend.h>
++#endif
++#include <linux/miscdevice.h>
++#include <linux/device.h>
++
++#include <plat/sys_config.h>
++
++#undef DEBUG_SUN4I
++
++#ifdef DEBUG_SUN4I
++#define sun4i_gpio_dbg(x...)	printk(x)
++#else
++#define sun4i_gpio_dbg(x...)
++#endif
++
++struct sun4i_gpio_data {
++	int status;
++	unsigned gpio_handler;
++	script_gpio_set_t info;
++	char name[8];
++#ifdef CONFIG_HAS_EARLYSUSPEND
++	struct early_suspend early_suspend;
++#endif
++};
++
++static int sun4i_gpio_num;
++static struct sun4i_gpio_data *psun4i_gpio;
++static struct device_attribute *pattr;
++
++static void set_sun4i_gpio_status(struct sun4i_gpio_data *sun4i_gpio,  int on)
++{
++	if(on) {
++		sun4i_gpio_dbg("\n-on-");
++		gpio_write_one_pin_value(sun4i_gpio->gpio_handler, 1, NULL);
++	}
++	else{
++		sun4i_gpio_dbg("\n-off-");
++		gpio_write_one_pin_value(sun4i_gpio->gpio_handler, 0, NULL);
++	}
++}
++
++static ssize_t sun4i_gpio_enable_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	unsigned long data;
++	int i,error;
++	struct sun4i_gpio_data *gpio_i = psun4i_gpio;
++
++	error = strict_strtoul(buf, 10, &data);
++	if (error)
++		return error;
++
++	for(i = 0; i < sun4i_gpio_num; i++) {
++		sun4i_gpio_dbg("%s\n", attr->attr.name);
++		sun4i_gpio_dbg("%s\n", gpio_i->name);
++
++		if(!strcmp(attr->attr.name, gpio_i->name)) {
++			set_sun4i_gpio_status(gpio_i, data);
++			break;
++		}
++		gpio_i++;
++	}
++
++	return count;
++}
++
++static ssize_t sun4i_gpio_enable_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	int i;
++	int data = EGPIO_FAIL;
++	struct sun4i_gpio_data *gpio_i = psun4i_gpio;
++
++	for(i = 0; i < sun4i_gpio_num; i++) {
++		sun4i_gpio_dbg("%s\n", attr->attr.name);
++		sun4i_gpio_dbg("%s\n", gpio_i->name);
++
++		if(!strcmp(attr->attr.name, gpio_i->name)) {
++			data = gpio_read_one_pin_value(gpio_i->gpio_handler, NULL);
++			sun4i_gpio_dbg("handler:%d\n", gpio_i->gpio_handler);
++			sun4i_gpio_dbg("data:%d\n", data);
++			break;
++		}
++		gpio_i++;
++	}
++
++	if(data != EGPIO_FAIL) {
++		return sprintf(buf, "%d\n", data);
++	} else {
++		return sprintf(buf, "error\n");
++	}
++}
++
++static struct attribute *sun4i_gpio_attributes[256] = {
++	NULL
++};
++
++static struct attribute_group sun4i_gpio_attribute_group = {
++	.name = "pin",
++	.attrs = sun4i_gpio_attributes
++};
++
++static int sun4i_gpio_open(struct inode *inode, struct file *file) {
++	pr_info("sun4i_gpio open\n");
++	return 0;
++}
++
++ssize_t sun4i_gpio_write(struct file *file, const char __user *buf, size_t size, loff_t *offset) {
++	pr_info("sun4i_gpio write\n");
++	return 0;
++}
++
++static int sun4i_gpio_release(struct inode *inode, struct file *file) {
++	gpio_release(psun4i_gpio->gpio_handler, 0);
++	kfree(psun4i_gpio);
++	return 0;
++}
++
++static const struct file_operations sun4i_gpio_fops = {
++	.open		= sun4i_gpio_open,
++	.write		= sun4i_gpio_write,
++	.release	= sun4i_gpio_release
++};
++
++static struct miscdevice sun4i_gpio_dev = {
++	.minor =	MISC_DYNAMIC_MINOR,
++	.name =		"sun4i-gpio",
++	.fops =		&sun4i_gpio_fops
++};
++
++static int __init sun4i_gpio_init(void) {
++	int err;
++	int i;
++	int sun4i_gpio_used = 0;
++	struct sun4i_gpio_data *gpio_i;
++	struct device_attribute *attr_i;
++	char pin[16];
++
++	pr_info("sun4i gpio driver init\n");
++
++	err = script_parser_fetch("gpio_para", "gpio_used", &sun4i_gpio_used, sizeof(sun4i_gpio_used)/sizeof(int));
++	if(err) {
++		pr_err("%s script_parser_fetch \"gpio_para\" \"gpio_used\" error\n", __FUNCTION__);
++		goto exit;
++	}
++
++	if(!sun4i_gpio_used) {
++		pr_err("%s sun4i_gpio is not used in config\n", __FUNCTION__);
++		err = -1;
++		goto exit;
++	}
++
++	err = script_parser_fetch("gpio_para", "gpio_num", &sun4i_gpio_num, sizeof(sun4i_gpio_num)/sizeof(int));
++	if(err) {
++		pr_err("%s script_parser_fetch \"gpio_para\" \"gpio_num\" error\n", __FUNCTION__);
++		goto exit;
++	}
++
++	sun4i_gpio_dbg("sun4i_gpio_num:%d\n", sun4i_gpio_num);
++	if(!sun4i_gpio_num) {
++		pr_err("%s sun4i_gpio_num is none\n", __FUNCTION__);
++		err = -1;
++		goto exit;
++	}
++
++	err = misc_register(&sun4i_gpio_dev);
++	if(err) {
++		pr_err("%s register sun4i_gpio as misc device error\n", __FUNCTION__);
++		goto exit;
++	}
++
++	psun4i_gpio = kzalloc(sizeof(struct sun4i_gpio_data) * sun4i_gpio_num, GFP_KERNEL);
++	pattr = kzalloc(sizeof(struct device_attribute) * sun4i_gpio_num, GFP_KERNEL);
++
++	if(!psun4i_gpio || !pattr) {
++		pr_err("%s kzalloc failed\n", __FUNCTION__);
++		err = -ENOMEM;
++		goto exit;
++	}
++
++	gpio_i = psun4i_gpio;
++	attr_i = pattr;
++
++	for(i = 0; i < sun4i_gpio_num; i++) {
++
++		sprintf(pin, "gpio_pin_%d", i+1);
++		sun4i_gpio_dbg("pin:%s\n", pin);
++
++		err = script_parser_fetch("gpio_para", pin,
++					(int *)&gpio_i->info, sizeof(script_gpio_set_t));
++
++		if(err) {
++			pr_err("%s script_parser_fetch \"gpio_para\" \"%s\" error\n", __FUNCTION__, pin);
++			break;
++		}
++
++		gpio_i->gpio_handler = gpio_request_ex("gpio_para", pin);
++		sun4i_gpio_dbg("gpio handler: %d", gpio_i->gpio_handler);
++
++		if(!gpio_i->gpio_handler) {
++			pr_err("%s can not get \"gpio_para\" \"%s\" gpio handler,\
++					already used by others?", __FUNCTION__, pin);
++			break;
++		}
++
++		sun4i_gpio_dbg("%s: port:%d, portnum:%d\n", pin, gpio_i->info.port,
++				gpio_i->info.port_num);
++
++		/* Turn the name to pa1, pb2 etc... */
++		sprintf(gpio_i->name, "p%c%d", 'a'+gpio_i->info.port-1, gpio_i->info.port_num);
++
++		sun4i_gpio_dbg("psun4i_gpio->name%s\n", gpio_i->name);
++
++		/* Add attributes to the group */
++		sysfs_attr_init(&attr_i->attr);
++		attr_i->attr.name = gpio_i->name;
++		attr_i->attr.mode = S_IRUGO|S_IWUSR|S_IWGRP|S_IWOTH;
++		attr_i->show = sun4i_gpio_enable_show;
++		attr_i->store = sun4i_gpio_enable_store;
++		sun4i_gpio_attributes[i] = &attr_i->attr;
++
++		gpio_i++;
++		attr_i++;
++	}
++
++	sysfs_create_group(&sun4i_gpio_dev.this_device->kobj,
++						 &sun4i_gpio_attribute_group);
++exit:
++	return err;
++}
++
++static void __exit sun4i_gpio_exit(void) {
++
++	sun4i_gpio_dbg("bye, sun4i_gpio exit\n");
++	misc_deregister(&sun4i_gpio_dev);
++	sysfs_remove_group(&sun4i_gpio_dev.this_device->kobj,
++						 &sun4i_gpio_attribute_group);
++	kfree(psun4i_gpio);
++	kfree(pattr);
++}
++
++module_init(sun4i_gpio_init);
++module_exit(sun4i_gpio_exit);
++
++MODULE_DESCRIPTION("a simple sun4i_gpio driver");
++MODULE_AUTHOR("Tom Cubie");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/sun4i-vibrator.c b/drivers/misc/sun4i-vibrator.c
+new file mode 100644
+index 0000000..537e2db
+--- /dev/null
++++ b/drivers/misc/sun4i-vibrator.c
+@@ -0,0 +1,166 @@
++/* Vibrator driver for sun4i platform
++ * ported from msm pmic vibrator driver
++ *  by tom cubie <tangliang@allwinnertech.com>
++ *
++ * Copyright (C) 2011 AllWinner Technology.
++ *
++ * Copyright (C) 2008 HTC Corporation.
++ * Copyright (C) 2007 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/platform_device.h>
++#include <linux/err.h>
++#include <linux/hrtimer.h>
++#include <linux/timed_output.h>
++//#include <linux/ktime.h>
++
++#include <mach/system.h>
++#include <mach/hardware.h>
++#include <plat/sys_config.h>
++
++static struct work_struct vibrator_work;
++static struct hrtimer vibe_timer;
++static spinlock_t vibe_lock;
++static int vibe_state;
++static int vibe_off;
++static script_gpio_set_t vibe_gpio;
++static unsigned vibe_gpio_handler;
++
++static void set_sun4i_vibrator(int on)
++{
++	if(on) {
++		gpio_write_one_pin_value(vibe_gpio_handler, !vibe_off, NULL);
++	}
++	else{
++		gpio_write_one_pin_value(vibe_gpio_handler, vibe_off, NULL);
++	}
++
++}
++
++static void update_vibrator(struct work_struct *work)
++{
++	set_sun4i_vibrator(vibe_state);
++}
++
++static void vibrator_enable(struct timed_output_dev *dev, int value)
++{
++	unsigned long	flags;
++
++	spin_lock_irqsave(&vibe_lock, flags);
++	hrtimer_cancel(&vibe_timer);
++
++	if (value <= 0)
++		vibe_state = 0;
++	else {
++		value = (value > 15000 ? 15000 : value);
++		vibe_state = 1;
++		hrtimer_start(&vibe_timer,
++			ktime_set(value / 1000, (value % 1000) * 1000000),
++			HRTIMER_MODE_REL);
++	}
++	spin_unlock_irqrestore(&vibe_lock, flags);
++
++	schedule_work(&vibrator_work);
++}
++
++static int vibrator_get_time(struct timed_output_dev *dev)
++{
++	struct timespec time_tmp;
++	if (hrtimer_active(&vibe_timer)) {
++		ktime_t r = hrtimer_get_remaining(&vibe_timer);
++		time_tmp = ktime_to_timespec(r);
++		//return r.tv.sec * 1000 + r.tv.nsec/1000000;
++		return time_tmp.tv_sec* 1000 + time_tmp.tv_nsec/1000000;
++	} else
++		return 0;
++}
++
++static enum hrtimer_restart vibrator_timer_func(struct hrtimer *timer)
++{
++	vibe_state = 0;
++	schedule_work(&vibrator_work);
++	return HRTIMER_NORESTART;
++}
++
++static struct timed_output_dev sun4i_vibrator = {
++	.name = "sun4i-vibrator",
++	.get_time = vibrator_get_time,
++	.enable = vibrator_enable,
++};
++
++static int __init sun4i_vibrator_init(void)
++{
++	int vibe_used;
++	int err = -1;
++
++	pr_info("hello, sun4i_vibrator init\n");
++	err = script_parser_fetch("motor_para", "motor_used",
++					&vibe_used, sizeof(vibe_used)/sizeof(int));
++	if(err) {
++		pr_err("%s script_parser_fetch \"motor_para\" \"motor_used\" error = %d\n",
++				__FUNCTION__, err);
++		goto exit;
++	}
++
++	if(!vibe_used) {
++		pr_err("%s motor is not used in config\n", __FUNCTION__);
++		err = -1;
++		goto exit;
++	}
++
++	err = script_parser_fetch("motor_para", "motor_shake",
++					(int *)&vibe_gpio, sizeof(vibe_gpio)/sizeof(int));
++
++	if(err) {
++		pr_err("%s script_parser_fetch \"motor_para\" \"motor_shaked\" error = %d\n",
++				__FUNCTION__, err);
++		goto exit;
++	}
++
++	vibe_off = vibe_gpio.data;
++	pr_debug("vibe_off is %d\n", vibe_off);
++
++	vibe_gpio_handler = gpio_request_ex("motor_para", "motor_shake");
++
++	if(!vibe_gpio_handler) {
++		pr_err("%s request motor gpio err\n", __FUNCTION__);
++		err = -1;
++		goto exit;
++	}
++
++	INIT_WORK(&vibrator_work, update_vibrator);
++
++	spin_lock_init(&vibe_lock);
++	vibe_state = 0;
++	hrtimer_init(&vibe_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	vibe_timer.function = vibrator_timer_func;
++
++	timed_output_dev_register(&sun4i_vibrator);
++
++exit:
++	return err;
++}
++
++static void __exit sun4i_vibrator_exit(void)
++{
++	pr_info("bye, sun4i_vibrator_exit\n");
++	timed_output_dev_unregister(&sun4i_vibrator);
++	gpio_release(vibe_gpio_handler, 0);
++}
++module_init(sun4i_vibrator_init);
++module_exit(sun4i_vibrator_exit);
++
++MODULE_DESCRIPTION("timed output vibrator device for sun4i");
++MODULE_LICENSE("GPL");
++
+diff --git a/drivers/misc/sunxi-dbgreg.c b/drivers/misc/sunxi-dbgreg.c
+new file mode 100644
+index 0000000..426d3e2
+--- /dev/null
++++ b/drivers/misc/sunxi-dbgreg.c
+@@ -0,0 +1,201 @@
++/* driver/misc/sunxi-dbgreg.c
++ *
++ *  Copyright (C) 2011 Allwinner Technology Co.Ltd
++ *  Tom Cubie <tangliang@allwinnertech.com>
++ *
++ *  www.allwinnertech.com
++ *
++ *  Read and write system registers in userspace.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/pm.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/miscdevice.h>
++#include <linux/device.h>
++
++#undef DEBUG_SUNXI
++
++#ifdef DEBUG_SUNXI
++#define sunxi_reg_dbg(x...) printk(x)
++#else
++#define sunxi_reg_dbg(x...)
++#endif
++
++
++static char readme[] = "This is a userspace interface to access the sunxi soc registers.\n"
++                       "Usage:\n"
++                       "\techo address > read           # Read the value at address\n"
++					   "\teg: echo f1c20c14 > read\n"
++                       "\techo address:value > write    # Write value to address\n"
++					   "\teg: echo f1c20c14:ffff > write\n"
++                       "\tcat read or cat write         # See this readme\n"
++                       "Note: Always use hex and always use virtual address\n"
++					   "Warnning: use at your own risk\n";
++
++static ssize_t sunxi_debugreg_read_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	unsigned long addr;
++	int err, len;
++
++	len = strlen(buf);
++
++	/* echo will append '\n', user may use 0x */
++	if( len != 9 && len != 11) {
++		printk("Invalid address length, please cat read to see readme\n");
++		return count;
++	}
++
++	err = strict_strtoul(buf, 16, &addr);
++
++	if (err) {
++		printk("Invalid value, please cat read to see readme\n");
++		return count;
++	}
++
++	if(addr < 0xf0000000) {
++		printk("Please use virtual address!!!\n");
++		return count;
++	}
++
++	printk("0x%x\n", readl(addr));
++
++	return count;
++}
++
++static ssize_t sunxi_debugreg_write_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	unsigned long addr, value;
++	int err, len;
++	const char *s = NULL;
++	char addrstr[16];
++
++	s = strchr(buf, ':');
++	if( s == NULL) {
++		printk("Wrong format, no :, please cat write to see readme\n");
++		return count;
++	}
++
++	len = s - buf;
++	sunxi_reg_dbg("len: %d\n", len);
++
++	if( len != 8 && len != 10) {
++		printk("Invalid address length, please cat write to see readme\n");
++		return count;
++	}
++
++	strncpy(addrstr, buf, len);
++	addrstr[len] = '\0';
++
++	sunxi_reg_dbg("addrstr: %s\n", addrstr);
++
++	err = strict_strtoul(addrstr, 16, &addr);
++	sunxi_reg_dbg("addr: 0x%lx\n", addr);
++	if(err) {
++		printk("Invalid address, please cat write to see readme\n");
++		return count;
++	}
++
++	/* value starts after the : */
++	len = strlen(s+1);
++	sunxi_reg_dbg("s+1 length: %d\n", len);
++	if( len > 11) {
++		printk("Invalid value length, please cat read to see readme\n");
++		return count;
++	}
++
++	err = strict_strtoul(s+1, 16, &value);
++	sunxi_reg_dbg("value: 0x%lx\n", value);
++
++	if(err) {
++		printk("Invalid value, please cat write to see readme\n");
++		return count;
++	}
++
++	if(addr < 0xf0000000) {
++		printk("Please use virtual address!!!\n");
++		return count;
++	}
++
++	writel(value, addr);
++
++	return count;
++}
++
++static ssize_t sunxi_debugreg_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, readme);
++}
++
++static DEVICE_ATTR(read, S_IRUGO|S_IWUSR|S_IWGRP|S_IWOTH,
++		sunxi_debugreg_show, sunxi_debugreg_read_store);
++static DEVICE_ATTR(write, S_IRUGO|S_IWUSR|S_IWGRP|S_IWOTH,
++		sunxi_debugreg_show, sunxi_debugreg_write_store);
++
++static struct attribute *sunxi_debugreg_attributes[] = {
++	&dev_attr_read.attr,
++	&dev_attr_write.attr,
++	NULL
++};
++
++static struct attribute_group sunxi_debugreg_attribute_group = {
++	.name = "rw",
++	.attrs = sunxi_debugreg_attributes
++};
++
++static struct miscdevice sunxi_debugreg_dev = {
++	.minor =	MISC_DYNAMIC_MINOR,
++	.name =		"sunxi-dbgreg",
++};
++
++static int __init sunxi_debugreg_init(void) {
++	int err;
++
++	pr_info("sunxi debug register driver init\n");
++
++	err = misc_register(&sunxi_debugreg_dev);
++	if(err) {
++		pr_err("%s register sunxi debug register driver as misc device error\n", __FUNCTION__);
++		goto exit;
++	}
++
++	err = sysfs_create_group(&sunxi_debugreg_dev.this_device->kobj,
++						 &sunxi_debugreg_attribute_group);
++
++	if(err) {
++		pr_err("%s create sysfs failed\n", __FUNCTION__);
++		goto exit;
++	}
++
++exit:
++	return err;
++}
++
++static void __exit sunxi_debugreg_exit(void) {
++
++	sunxi_reg_dbg("bye, sun4i_debugreg exit\n");
++	misc_deregister(&sunxi_debugreg_dev);
++	sysfs_remove_group(&sunxi_debugreg_dev.this_device->kobj,
++						 &sunxi_debugreg_attribute_group);
++}
++
++module_init(sunxi_debugreg_init);
++module_exit(sunxi_debugreg_exit);
++
++MODULE_DESCRIPTION("a simple sunxi debug driver");
++MODULE_AUTHOR("Tom Cubie");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/uid_stat.c b/drivers/misc/uid_stat.c
+new file mode 100644
+index 0000000..2141124
+--- /dev/null
++++ b/drivers/misc/uid_stat.c
+@@ -0,0 +1,156 @@
++/* drivers/misc/uid_stat.c
++ *
++ * Copyright (C) 2008 - 2009 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <asm/atomic.h>
++
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/proc_fs.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/stat.h>
++#include <linux/uid_stat.h>
++#include <net/activity_stats.h>
++
++static DEFINE_SPINLOCK(uid_lock);
++static LIST_HEAD(uid_list);
++static struct proc_dir_entry *parent;
++
++struct uid_stat {
++	struct list_head link;
++	uid_t uid;
++	atomic_t tcp_rcv;
++	atomic_t tcp_snd;
++};
++
++static struct uid_stat *find_uid_stat(uid_t uid) {
++	unsigned long flags;
++	struct uid_stat *entry;
++
++	spin_lock_irqsave(&uid_lock, flags);
++	list_for_each_entry(entry, &uid_list, link) {
++		if (entry->uid == uid) {
++			spin_unlock_irqrestore(&uid_lock, flags);
++			return entry;
++		}
++	}
++	spin_unlock_irqrestore(&uid_lock, flags);
++	return NULL;
++}
++
++static int tcp_snd_read_proc(char *page, char **start, off_t off,
++				int count, int *eof, void *data)
++{
++	int len;
++	unsigned int bytes;
++	char *p = page;
++	struct uid_stat *uid_entry = (struct uid_stat *) data;
++	if (!data)
++		return 0;
++
++	bytes = (unsigned int) (atomic_read(&uid_entry->tcp_snd) + INT_MIN);
++	p += sprintf(p, "%u\n", bytes);
++	len = (p - page) - off;
++	*eof = (len <= count) ? 1 : 0;
++	*start = page + off;
++	return len;
++}
++
++static int tcp_rcv_read_proc(char *page, char **start, off_t off,
++				int count, int *eof, void *data)
++{
++	int len;
++	unsigned int bytes;
++	char *p = page;
++	struct uid_stat *uid_entry = (struct uid_stat *) data;
++	if (!data)
++		return 0;
++
++	bytes = (unsigned int) (atomic_read(&uid_entry->tcp_rcv) + INT_MIN);
++	p += sprintf(p, "%u\n", bytes);
++	len = (p - page) - off;
++	*eof = (len <= count) ? 1 : 0;
++	*start = page + off;
++	return len;
++}
++
++/* Create a new entry for tracking the specified uid. */
++static struct uid_stat *create_stat(uid_t uid) {
++	unsigned long flags;
++	char uid_s[32];
++	struct uid_stat *new_uid;
++	struct proc_dir_entry *entry;
++
++	/* Create the uid stat struct and append it to the list. */
++	if ((new_uid = kmalloc(sizeof(struct uid_stat), GFP_KERNEL)) == NULL)
++		return NULL;
++
++	new_uid->uid = uid;
++	/* Counters start at INT_MIN, so we can track 4GB of network traffic. */
++	atomic_set(&new_uid->tcp_rcv, INT_MIN);
++	atomic_set(&new_uid->tcp_snd, INT_MIN);
++
++	spin_lock_irqsave(&uid_lock, flags);
++	list_add_tail(&new_uid->link, &uid_list);
++	spin_unlock_irqrestore(&uid_lock, flags);
++
++	sprintf(uid_s, "%d", uid);
++	entry = proc_mkdir(uid_s, parent);
++
++	/* Keep reference to uid_stat so we know what uid to read stats from. */
++	create_proc_read_entry("tcp_snd", S_IRUGO, entry , tcp_snd_read_proc,
++		(void *) new_uid);
++
++	create_proc_read_entry("tcp_rcv", S_IRUGO, entry, tcp_rcv_read_proc,
++		(void *) new_uid);
++
++	return new_uid;
++}
++
++int uid_stat_tcp_snd(uid_t uid, int size) {
++	struct uid_stat *entry;
++	activity_stats_update();
++	if ((entry = find_uid_stat(uid)) == NULL &&
++		((entry = create_stat(uid)) == NULL)) {
++			return -1;
++	}
++	atomic_add(size, &entry->tcp_snd);
++	return 0;
++}
++
++int uid_stat_tcp_rcv(uid_t uid, int size) {
++	struct uid_stat *entry;
++	activity_stats_update();
++	if ((entry = find_uid_stat(uid)) == NULL &&
++		((entry = create_stat(uid)) == NULL)) {
++			return -1;
++	}
++	atomic_add(size, &entry->tcp_rcv);
++	return 0;
++}
++
++static int __init uid_stat_init(void)
++{
++	parent = proc_mkdir("uid_stat", NULL);
++	if (!parent) {
++		pr_err("uid_stat: failed to create proc entry\n");
++		return -1;
++	}
++	return 0;
++}
++
++__initcall(uid_stat_init);
+diff --git a/drivers/misc/wl127x-rfkill.c b/drivers/misc/wl127x-rfkill.c
+new file mode 100644
+index 0000000..f5b9515
+--- /dev/null
++++ b/drivers/misc/wl127x-rfkill.c
+@@ -0,0 +1,121 @@
++/*
++ * Bluetooth TI wl127x rfkill power control via GPIO
++ *
++ * Copyright (C) 2009 Motorola, Inc.
++ * Copyright (C) 2008 Texas Instruments
++ * Initial code: Pavan Savoy <pavan.savoy@gmail.com> (wl127x_power.c)
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/gpio.h>
++#include <linux/rfkill.h>
++#include <linux/platform_device.h>
++#include <linux/wl127x-rfkill.h>
++
++static int wl127x_rfkill_set_power(void *data, enum rfkill_state state)
++{
++	int nshutdown_gpio = (int) data;
++
++	switch (state) {
++	case RFKILL_STATE_UNBLOCKED:
++		gpio_set_value(nshutdown_gpio, 1);
++		break;
++	case RFKILL_STATE_SOFT_BLOCKED:
++		gpio_set_value(nshutdown_gpio, 0);
++		break;
++	default:
++		printk(KERN_ERR "invalid bluetooth rfkill state %d\n", state);
++	}
++	return 0;
++}
++
++static int wl127x_rfkill_probe(struct platform_device *pdev)
++{
++	int rc = 0;
++	struct wl127x_rfkill_platform_data *pdata = pdev->dev.platform_data;
++	enum rfkill_state default_state = RFKILL_STATE_SOFT_BLOCKED;  /* off */
++
++	rc = gpio_request(pdata->nshutdown_gpio, "wl127x_nshutdown_gpio");
++	if (unlikely(rc))
++		return rc;
++
++	rc = gpio_direction_output(pdata->nshutdown_gpio, 0);
++	if (unlikely(rc))
++		return rc;
++
++	rfkill_set_default(RFKILL_TYPE_BLUETOOTH, default_state);
++	wl127x_rfkill_set_power(NULL, default_state);
++
++	pdata->rfkill = rfkill_allocate(&pdev->dev, RFKILL_TYPE_BLUETOOTH);
++	if (unlikely(!pdata->rfkill))
++		return -ENOMEM;
++
++	pdata->rfkill->name = "wl127x";
++	pdata->rfkill->state = default_state;
++	/* userspace cannot take exclusive control */
++	pdata->rfkill->user_claim_unsupported = 1;
++	pdata->rfkill->user_claim = 0;
++	pdata->rfkill->data = (void *) pdata->nshutdown_gpio;
++	pdata->rfkill->toggle_radio = wl127x_rfkill_set_power;
++
++	rc = rfkill_register(pdata->rfkill);
++
++	if (unlikely(rc))
++		rfkill_free(pdata->rfkill);
++
++	return 0;
++}
++
++static int wl127x_rfkill_remove(struct platform_device *pdev)
++{
++	struct wl127x_rfkill_platform_data *pdata = pdev->dev.platform_data;
++
++	rfkill_unregister(pdata->rfkill);
++	rfkill_free(pdata->rfkill);
++	gpio_free(pdata->nshutdown_gpio);
++
++	return 0;
++}
++
++static struct platform_driver wl127x_rfkill_platform_driver = {
++	.probe = wl127x_rfkill_probe,
++	.remove = wl127x_rfkill_remove,
++	.driver = {
++		   .name = "wl127x-rfkill",
++		   .owner = THIS_MODULE,
++		   },
++};
++
++static int __init wl127x_rfkill_init(void)
++{
++	return platform_driver_register(&wl127x_rfkill_platform_driver);
++}
++
++static void __exit wl127x_rfkill_exit(void)
++{
++	platform_driver_unregister(&wl127x_rfkill_platform_driver);
++}
++
++module_init(wl127x_rfkill_init);
++module_exit(wl127x_rfkill_exit);
++
++MODULE_ALIAS("platform:wl127x");
++MODULE_DESCRIPTION("wl127x-rfkill");
++MODULE_AUTHOR("Motorola");
++MODULE_LICENSE("GPL");

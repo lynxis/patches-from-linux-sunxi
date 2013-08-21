@@ -1,0 +1,818 @@
+diff --git a/drivers/leds/Kconfig b/drivers/leds/Kconfig
+index ff4b8cf..8f1ccfe 100644
+--- a/drivers/leds/Kconfig
++++ b/drivers/leds/Kconfig
+@@ -40,6 +40,16 @@ config LEDS_ATMEL_PWM
+ 	  This option enables support for LEDs driven using outputs
+ 	  of the dedicated PWM controller found on newer Atmel SOCs.
+ 
++config LEDS_SUNXI
++	tristate "LED Support for sunxi platform"
++	depends on LEDS_CLASS
++	depends on (ARCH_SUN4I || ARCH_SUN5I || ARCH_SUN7I)
++	help
++	  This option enables support for LEDs connected to gpio
++	  lines on the Allwinner SOCs (sun4i/sun5i).
++	  The leds must be defined in [leds_para] section of sysconfig.fex
++	  file (leds_used/leds_num/leds_pin_x/leds_name_x variables)
++
+ config LEDS_LM3530
+ 	tristate "LCD Backlight driver for LM3530"
+ 	depends on LEDS_CLASS
+@@ -448,6 +458,16 @@ config LEDS_TRIGGER_BACKLIGHT
+ 
+ 	  If unsure, say N.
+ 
++config LEDS_TRIGGER_CPU
++	bool "LED CPU Trigger"
++	depends on LEDS_TRIGGERS
++	help
++	  This allows LEDs to be controlled by active CPUs. This shows
++	  the active CPUs across an array of LEDs so you can see which
++	  CPUs are active on the system at any given moment.
++
++	  If unsure, say N.
++
+ config LEDS_TRIGGER_GPIO
+ 	tristate "LED GPIO Trigger"
+ 	depends on LEDS_TRIGGERS
+@@ -468,6 +488,12 @@ config LEDS_TRIGGER_DEFAULT_ON
+ 	  This allows LEDs to be initialised in the ON state.
+ 	  If unsure, say Y.
+ 
++config LEDS_TRIGGER_SLEEP
++	tristate "LED Sleep Mode Trigger"
++	depends on LEDS_TRIGGERS && HAS_EARLYSUSPEND
++	help
++	  This turns LEDs on when the screen is off but the cpu still running.
++
+ comment "iptables trigger is under Netfilter config (LED target)"
+ 	depends on LEDS_TRIGGERS
+ 
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+index 890481c..df48868 100644
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -45,6 +45,7 @@ obj-$(CONFIG_LEDS_NETXBIG)		+= leds-netxbig.o
+ obj-$(CONFIG_LEDS_ASIC3)		+= leds-asic3.o
+ obj-$(CONFIG_LEDS_RENESAS_TPU)		+= leds-renesas-tpu.o
+ obj-$(CONFIG_LEDS_MAX8997)		+= leds-max8997.o
++obj-$(CONFIG_LEDS_SUNXI)		+= leds-sunxi.o
+ 
+ # LED SPI Drivers
+ obj-$(CONFIG_LEDS_DAC124S085)		+= leds-dac124s085.o
+@@ -55,4 +56,6 @@ obj-$(CONFIG_LEDS_TRIGGER_IDE_DISK)	+= ledtrig-ide-disk.o
+ obj-$(CONFIG_LEDS_TRIGGER_HEARTBEAT)	+= ledtrig-heartbeat.o
+ obj-$(CONFIG_LEDS_TRIGGER_BACKLIGHT)	+= ledtrig-backlight.o
+ obj-$(CONFIG_LEDS_TRIGGER_GPIO)		+= ledtrig-gpio.o
++obj-$(CONFIG_LEDS_TRIGGER_CPU)		+= ledtrig-cpu.o
+ obj-$(CONFIG_LEDS_TRIGGER_DEFAULT_ON)	+= ledtrig-default-on.o
++obj-$(CONFIG_LEDS_TRIGGER_SLEEP)	+= ledtrig-sleep.o
+diff --git a/drivers/leds/led-triggers.c b/drivers/leds/led-triggers.c
+index 46b4c76..a85ce09 100644
+--- a/drivers/leds/led-triggers.c
++++ b/drivers/leds/led-triggers.c
+@@ -102,6 +102,12 @@ EXPORT_SYMBOL_GPL(led_trigger_show);
+ void led_trigger_set(struct led_classdev *led_cdev, struct led_trigger *trigger)
+ {
+ 	unsigned long flags;
++	char *event = NULL;
++	char *envp[2];
++	const char *name;
++
++	name = trigger ? trigger->name : "none";
++	event = kasprintf(GFP_KERNEL, "TRIGGER=%s", name);
+ 
+ 	/* Remove any existing trigger */
+ 	if (led_cdev->trigger) {
+@@ -122,6 +128,13 @@ void led_trigger_set(struct led_classdev *led_cdev, struct led_trigger *trigger)
+ 		if (trigger->activate)
+ 			trigger->activate(led_cdev);
+ 	}
++
++	if (event) {
++		envp[0] = event;
++		envp[1] = NULL;
++		kobject_uevent_env(&led_cdev->dev->kobj, KOBJ_CHANGE, envp);
++		kfree(event);
++	}
+ }
+ EXPORT_SYMBOL_GPL(led_trigger_set);
+ 
+diff --git a/drivers/leds/leds-sunxi.c b/drivers/leds/leds-sunxi.c
+new file mode 100644
+index 0000000..da33b2f
+--- /dev/null
++++ b/drivers/leds/leds-sunxi.c
+@@ -0,0 +1,477 @@
++/* driver/misc/leds-sunxi.c
++ *
++ *  LED driver for sunxi platform (modified generic leds-gpio driver)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/leds.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <plat/sys_config.h>
++#include <linux/workqueue.h>
++
++struct sunxi_gpio_data {
++	unsigned gpio_handler;
++	script_gpio_set_t info;
++	char pin_name[16];
++	char led_name[64];
++	char trigger_name[64];
++};
++
++struct gpio_led_data {
++	struct led_classdev cdev;
++	unsigned gpio;
++	struct work_struct work;
++	u8 new_level;
++	u8 can_sleep;
++	u8 active_low;
++	u8 blinking;
++	int (*platform_gpio_blink_set)(unsigned gpio, int state,
++			unsigned long *delay_on, unsigned long *delay_off);
++};
++
++struct sunxi_leds_priv {
++	int num_leds;
++	struct gpio_led_data leds[];
++};
++
++static int sunxi_leds_num;
++static struct gpio_led *sunxi_leds;
++static struct sunxi_gpio_data *psunxi_leds;
++static struct gpio_led_platform_data gpio_led_data;
++struct platform_device *pdev;
++
++/* Get gpio pin value */
++int sunxi_gpio_get_value(unsigned gpio)
++{
++	int  ret;
++	user_gpio_set_t gpio_info[1];
++
++	if (gpio >= sunxi_leds_num)
++		return -1;
++
++	ret = gpio_get_one_pin_status(psunxi_leds[gpio].gpio_handler,
++				gpio_info, psunxi_leds[gpio].pin_name, 1);
++
++	return gpio_info->data;
++}
++
++/* Set pin value (output mode) */
++void sunxi_gpio_set_value(unsigned gpio, int value)
++{
++	int ret ;
++
++	if (gpio >= sunxi_leds_num)
++		return;
++
++	ret = gpio_write_one_pin_value(psunxi_leds[gpio].gpio_handler,
++					value, psunxi_leds[gpio].pin_name);
++
++	return;
++}
++
++/* Set pin direction -> out (mul_sel = 1), pin_data -> value */
++static int sunxi_direction_output(unsigned gpio, int value)
++{
++	int ret;
++
++	if (gpio >= sunxi_leds_num)
++		return -1;
++
++	ret =  gpio_set_one_pin_io_status(psunxi_leds[gpio].gpio_handler, 1,
++					psunxi_leds[gpio].pin_name);
++	if (!ret)
++		ret = gpio_write_one_pin_value(psunxi_leds[gpio].gpio_handler,
++					value, psunxi_leds[gpio].pin_name);
++
++	return ret;
++}
++
++/* Check if gpio num requested and valid */
++static int sunxi_gpio_is_valid(unsigned gpio)
++{
++	if (gpio >= sunxi_leds_num)
++		return 0;
++
++	if (psunxi_leds[gpio].gpio_handler)
++		return 1;
++
++	return 0;
++}
++
++/* Unregister led device */
++static void delete_sunxi_led(struct gpio_led_data *led)
++{
++	if (!sunxi_gpio_is_valid(led->gpio))
++		return;
++
++	led_classdev_unregister(&led->cdev);
++	cancel_work_sync(&led->work);
++}
++
++/* Unregister & remove all leds */
++static int __devexit sunxi_led_remove(struct platform_device *pdev)
++{
++	struct sunxi_leds_priv *priv = dev_get_drvdata(&pdev->dev);
++	int i;
++
++	for (i = 0; i < priv->num_leds; i++)
++		delete_sunxi_led(&priv->leds[i]);
++
++	dev_set_drvdata(&pdev->dev, NULL);
++	kfree(priv);
++
++	return 0;
++}
++
++static inline int sizeof_sunxi_leds_priv(int num_leds)
++{
++	return sizeof(struct sunxi_leds_priv) +
++		(sizeof(struct gpio_led_data) * num_leds);
++}
++
++static void sunxi_led_work(struct work_struct *work)
++{
++	struct gpio_led_data	*led_dat =
++		container_of(work, struct gpio_led_data, work);
++
++	if (led_dat->blinking) {
++		led_dat->platform_gpio_blink_set(led_dat->gpio,
++						 led_dat->new_level,
++						 NULL, NULL);
++		led_dat->blinking = 0;
++	} else
++		sunxi_gpio_set_value(led_dat->gpio, led_dat->new_level);
++}
++
++static void sunxi_led_set(struct led_classdev *led_cdev,
++	enum led_brightness value)
++{
++	struct gpio_led_data *led_dat =
++		container_of(led_cdev, struct gpio_led_data, cdev);
++	int level;
++
++	if (value == LED_OFF)
++		level = 0;
++	else
++		level = 1;
++
++	if (led_dat->active_low)
++		level = !level;
++
++	if (led_dat->can_sleep) {
++		led_dat->new_level = level;
++		schedule_work(&led_dat->work);
++	} else {
++		if (led_dat->blinking) {
++			led_dat->platform_gpio_blink_set(led_dat->gpio, level,
++							 NULL, NULL);
++			led_dat->blinking = 0;
++		} else
++			sunxi_gpio_set_value(led_dat->gpio, level);
++	}
++}
++
++static int sunxi_blink_set(struct led_classdev *led_cdev,
++	unsigned long *delay_on, unsigned long *delay_off)
++{
++	struct gpio_led_data *led_dat =
++		container_of(led_cdev, struct gpio_led_data, cdev);
++
++	led_dat->blinking = 1;
++	return led_dat->platform_gpio_blink_set(led_dat->gpio, GPIO_LED_BLINK,
++						delay_on, delay_off);
++}
++
++static int __devinit create_sunxi_led(const struct gpio_led *template,
++	struct gpio_led_data *led_dat, struct device *parent,
++	int (*blink_set)(unsigned, int, unsigned long *, unsigned long *))
++{
++	int ret = 0;
++	int state = 0;
++
++	led_dat->gpio = -1;
++
++	/* skip leds that aren't available */
++	if (!sunxi_gpio_is_valid(template->gpio)) {
++		printk(KERN_INFO "Skipping unavailable LED gpio %d (%s)\n",
++				template->gpio, template->name);
++		return 0;
++	}
++
++	led_dat->cdev.name = template->name;
++	led_dat->cdev.default_trigger = template->default_trigger;
++	led_dat->gpio = template->gpio;
++	led_dat->can_sleep = 0;
++	led_dat->active_low = template->active_low;
++	led_dat->blinking = 0;
++	if (blink_set) {
++		led_dat->platform_gpio_blink_set = blink_set;
++		led_dat->cdev.blink_set = sunxi_blink_set;
++	}
++	led_dat->cdev.brightness_set = sunxi_led_set;
++	if (template->default_state == LEDS_GPIO_DEFSTATE_KEEP) {
++		state = sunxi_gpio_get_value(led_dat->gpio);
++		if (led_dat->active_low)
++			state = !state;
++	} else
++		state = (template->default_state == LEDS_GPIO_DEFSTATE_ON);
++	led_dat->cdev.brightness = state ? LED_FULL : LED_OFF;
++	if (!template->retain_state_suspended)
++		led_dat->cdev.flags |= LED_CORE_SUSPENDRESUME;
++
++	ret = sunxi_direction_output(led_dat->gpio,
++					led_dat->active_low ^ state);
++	if (ret < 0)
++		goto err;
++
++	INIT_WORK(&led_dat->work, sunxi_led_work);
++
++	ret = led_classdev_register(parent, &led_dat->cdev);
++	if (ret < 0)
++		goto err;
++
++	return 0;
++
++err:
++	return ret;
++}
++
++static int __devinit sunxi_led_probe(struct platform_device *pdev)
++{
++	struct gpio_led_platform_data *pdata = pdev->dev.platform_data;
++	struct sunxi_leds_priv *priv;
++	int i, ret = 0;
++
++	if (pdata && pdata->num_leds) {
++		priv = kzalloc(sizeof_sunxi_leds_priv(pdata->num_leds),
++				GFP_KERNEL);
++		if (!priv)
++			return -ENOMEM;
++
++		priv->num_leds = pdata->num_leds;
++		for (i = 0; i < priv->num_leds; i++) {
++			ret = create_sunxi_led(&pdata->leds[i],
++					      &priv->leds[i],
++					      &pdev->dev,
++					      pdata->gpio_blink_set);
++
++			if (ret < 0) {
++				/* On failure: unwind the led creations */
++				for (i = i - 1; i >= 0; i--)
++					delete_sunxi_led(&priv->leds[i]);
++
++				kfree(priv);
++				return ret;
++			}
++		}
++	} else {
++		return -ENODEV;
++	}
++
++	platform_set_drvdata(pdev, priv);
++	return 0;
++}
++
++static struct platform_driver sunxi_led_driver = {
++	.probe		= sunxi_led_probe,
++	.remove		= __devexit_p(sunxi_led_remove),
++	.driver		= {
++		.name	= "leds-sunxi",
++		.owner	= THIS_MODULE,
++	},
++};
++
++static int __init sunxi_leds_init(void)
++{
++	int i, err, value;
++	int sunxi_leds_used = 0;
++	struct sunxi_gpio_data *leds_i;
++	struct gpio_led *dleds_i;
++	char key[20];
++
++	/* parse script.bin for [leds_para] section
++	   leds_used/leds_num/leds_pin_x/leds_name_x */
++
++	pr_info("sunxi_leds driver init\n");
++	err = script_parser_fetch("leds_para", "leds_used", &sunxi_leds_used,
++					sizeof(sunxi_leds_used)/sizeof(int));
++	if (err) {
++		/* Not error - just info */
++		pr_info("sunxi leds can't find script data '[leds_para]' 'leds_used'\n");
++		return err;
++	}
++
++	if (!sunxi_leds_used) {
++		pr_info("%s leds_used is false. Skip leds initialization\n",
++			__func__);
++		err = 0;
++		return err;
++	}
++
++	err = script_parser_fetch("leds_para", "leds_num", &sunxi_leds_num,
++					sizeof(sunxi_leds_num)/sizeof(int));
++	if (err) {
++		pr_err("%s script_parser_fetch '[leds_para]' 'leds_num' error\n",
++			__func__);
++		return err;
++	}
++
++	if (!sunxi_leds_num) {
++		pr_info("%s sunxi_leds_num is none. Skip leds initialization\n",
++			__func__);
++		err = 0;
++		return err;
++	}
++
++	/* allocate memory for leds gpio data and platform device data */
++	psunxi_leds = kzalloc(sizeof(struct sunxi_gpio_data) * sunxi_leds_num,
++				GFP_KERNEL);
++
++	sunxi_leds = kzalloc(sizeof(struct gpio_led) * sunxi_leds_num,
++				GFP_KERNEL);
++
++	if ((!psunxi_leds) || (!sunxi_leds)) {
++		pr_err("%s kzalloc failed\n", __func__);
++		err = -ENOMEM;
++		goto exit;
++	}
++
++	leds_i = psunxi_leds;
++	dleds_i = sunxi_leds;
++
++	/* parse leds gpio/name script data */
++	for (i = 0; i < sunxi_leds_num; i++) {
++
++		/* make next script entry name */
++		sprintf(leds_i->pin_name, "leds_pin_%d", i+1);
++
++		/* fetch next led name */
++		sprintf(key, "leds_name_%d", i + 1);
++		err = script_parser_fetch("leds_para", key,
++					  (int *)leds_i->led_name,
++					  sizeof(leds_i->led_name)/sizeof(int));
++		if (err) {
++			pr_err("%s script_parser_fetch '[leds_para]' '%s' error\n",
++				__func__, key);
++			goto exit;
++		}
++
++		/* fetch next led gpio information */
++		sprintf(key, "leds_pin_%d", i + 1);
++		err = script_parser_fetch("leds_para", key,
++					(int *)&leds_i->info,
++					sizeof(script_gpio_set_t));
++
++		if (err) {
++			pr_err("%s script_parser_fetch '[leds_para]' '%s' error\n",
++				__func__, key);
++			break;
++		}
++
++		/* reserve gpio for led */
++		leds_i->gpio_handler = gpio_request_ex("leds_para", key);
++		if (!leds_i->gpio_handler) {
++			pr_err("%s can't request '[leds_para]' '%s', already used ?",
++				__func__, key);
++			break;
++		}
++
++		/* Fill gpio_led structure */
++		dleds_i->name = leds_i->led_name;
++		dleds_i->default_state = LEDS_GPIO_DEFSTATE_OFF;
++		dleds_i->gpio = i;
++		dleds_i->default_trigger = "none";
++
++		sprintf(key, "leds_default_%d", i + 1); value = 0;
++		err = script_parser_fetch("leds_para", key, &value, 1);
++		if (err == 0)
++			dleds_i->default_state = value;
++
++		sprintf(key, "leds_inverted_%d", i + 1); value = 0;
++		err = script_parser_fetch("leds_para", key, &value, 1);
++		if (err == 0 && value)
++			dleds_i->active_low = 1;
++
++		sprintf(key, "leds_trigger_%d", i + 1); value = 0;
++		err = script_parser_fetch("leds_para", key,
++					  (int *)leds_i->trigger_name,
++					  sizeof(leds_i->trigger_name)/sizeof(int));
++		if (err == 0)
++			dleds_i->default_trigger = leds_i->trigger_name;
++
++		leds_i++;
++		dleds_i++;
++	}
++
++	gpio_led_data.num_leds = sunxi_leds_num;
++	gpio_led_data.leds = sunxi_leds;
++	gpio_led_data.gpio_blink_set = NULL;
++
++	pdev = platform_device_alloc("leds-sunxi", -1);
++	if (!pdev)
++		goto exit;
++
++	err = platform_device_add_data(pdev, &gpio_led_data,
++					sizeof(gpio_led_data));
++	if (err)
++		goto exit;
++
++	err = platform_device_add(pdev);
++	if (err)
++		goto exit;
++
++	return platform_driver_register(&sunxi_led_driver);
++
++exit:
++	if (err != -ENOMEM) {
++
++		for (i = 0; i < sunxi_leds_num; i++) {
++			if (psunxi_leds[i].gpio_handler)
++				gpio_release(psunxi_leds[i].gpio_handler, 1);
++		}
++
++		kfree(psunxi_leds);
++		kfree(sunxi_leds);
++		return err;
++	}
++
++	return err;
++}
++
++static void __exit sunxi_leds_exit(void)
++{
++	int i;
++	pr_info("sunxi_leds driver unload\n");
++
++	/* unregister driver */
++	platform_driver_unregister(&sunxi_led_driver);
++
++	/* remove platform device */
++	platform_device_unregister(pdev);
++
++	for (i = 0; i < sunxi_leds_num; i++) {
++		if (psunxi_leds[i].gpio_handler)
++			gpio_release(psunxi_leds[i].gpio_handler, 1);
++	}
++
++	/* free allocated memory */
++	kfree(psunxi_leds);
++	kfree(sunxi_leds);
++}
++
++module_init(sunxi_leds_init);
++module_exit(sunxi_leds_exit);
++
++MODULE_ALIAS("platform:leds-sunxi");
++MODULE_DESCRIPTION("sunxi led driver");
++MODULE_AUTHOR("Alexandr V. Shutko <alex@shutko.ru>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/leds/ledtrig-cpu.c b/drivers/leds/ledtrig-cpu.c
+new file mode 100644
+index 0000000..4239b39
+--- /dev/null
++++ b/drivers/leds/ledtrig-cpu.c
+@@ -0,0 +1,142 @@
++/*
++ * ledtrig-cpu.c - LED trigger based on CPU activity
++ *
++ * This LED trigger will be registered for each possible CPU and named as
++ * cpu0, cpu1, cpu2, cpu3, etc.
++ *
++ * It can be bound to any LED just like other triggers using either a
++ * board file or via sysfs interface.
++ *
++ * An API named ledtrig_cpu is exported for any user, who want to add CPU
++ * activity indication in their code
++ *
++ * Copyright 2011 Linus Walleij <linus.walleij@linaro.org>
++ * Copyright 2011 - 2012 Bryan Wu <bryan.wu@canonical.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/percpu.h>
++#include <linux/syscore_ops.h>
++#include <linux/rwsem.h>
++#include "leds.h"
++
++#define MAX_NAME_LEN	8
++
++struct led_trigger_cpu {
++	char name[MAX_NAME_LEN];
++	struct led_trigger *_trig;
++};
++
++static DEFINE_PER_CPU(struct led_trigger_cpu, cpu_trig);
++
++/**
++ * ledtrig_cpu - emit a CPU event as a trigger
++ * @evt: CPU event to be emitted
++ *
++ * Emit a CPU event on a CPU core, which will trigger a
++ * binded LED to turn on or turn off.
++ */
++void ledtrig_cpu(enum cpu_led_event ledevt)
++{
++	struct led_trigger_cpu *trig = &__get_cpu_var(cpu_trig);
++
++	/* Locate the correct CPU LED */
++	switch (ledevt) {
++	case CPU_LED_IDLE_END:
++	case CPU_LED_START:
++		/* Will turn the LED on, max brightness */
++		led_trigger_event(trig->_trig, LED_FULL);
++		break;
++
++	case CPU_LED_IDLE_START:
++	case CPU_LED_STOP:
++	case CPU_LED_HALTED:
++		/* Will turn the LED off */
++		led_trigger_event(trig->_trig, LED_OFF);
++		break;
++
++	default:
++		/* Will leave the LED as it is */
++		break;
++	}
++}
++EXPORT_SYMBOL(ledtrig_cpu);
++
++static int ledtrig_cpu_syscore_suspend(void)
++{
++	ledtrig_cpu(CPU_LED_STOP);
++	return 0;
++}
++
++static void ledtrig_cpu_syscore_resume(void)
++{
++	ledtrig_cpu(CPU_LED_START);
++}
++
++static void ledtrig_cpu_syscore_shutdown(void)
++{
++	ledtrig_cpu(CPU_LED_HALTED);
++}
++
++static struct syscore_ops ledtrig_cpu_syscore_ops = {
++	.shutdown	= ledtrig_cpu_syscore_shutdown,
++	.suspend	= ledtrig_cpu_syscore_suspend,
++	.resume		= ledtrig_cpu_syscore_resume,
++};
++
++static int __init ledtrig_cpu_init(void)
++{
++	int cpu;
++
++	/* Supports up to 9999 cpu cores */
++	BUILD_BUG_ON(CONFIG_NR_CPUS > 9999);
++
++	/*
++	 * Registering CPU led trigger for each CPU core here
++	 * ignores CPU hotplug, but after this CPU hotplug works
++	 * fine with this trigger.
++	 */
++	for_each_possible_cpu(cpu) {
++		struct led_trigger_cpu *trig = &per_cpu(cpu_trig, cpu);
++
++		snprintf(trig->name, MAX_NAME_LEN, "cpu%d", cpu);
++
++		led_trigger_register_simple(trig->name, &trig->_trig);
++	}
++
++	register_syscore_ops(&ledtrig_cpu_syscore_ops);
++
++	pr_info("ledtrig-cpu: registered to indicate activity on CPUs\n");
++
++	return 0;
++}
++module_init(ledtrig_cpu_init);
++
++static void __exit ledtrig_cpu_exit(void)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct led_trigger_cpu *trig = &per_cpu(cpu_trig, cpu);
++
++		led_trigger_unregister_simple(trig->_trig);
++		trig->_trig = NULL;
++		memset(trig->name, 0, MAX_NAME_LEN);
++	}
++
++	unregister_syscore_ops(&ledtrig_cpu_syscore_ops);
++}
++module_exit(ledtrig_cpu_exit);
++
++MODULE_AUTHOR("Linus Walleij <linus.walleij@linaro.org>");
++MODULE_AUTHOR("Bryan Wu <bryan.wu@canonical.com>");
++MODULE_DESCRIPTION("CPU LED trigger");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/leds/ledtrig-sleep.c b/drivers/leds/ledtrig-sleep.c
+new file mode 100644
+index 0000000..f164042
+--- /dev/null
++++ b/drivers/leds/ledtrig-sleep.c
+@@ -0,0 +1,80 @@
++/* drivers/leds/ledtrig-sleep.c
++ *
++ * Copyright (C) 2007 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/earlysuspend.h>
++#include <linux/leds.h>
++#include <linux/suspend.h>
++
++static int ledtrig_sleep_pm_callback(struct notifier_block *nfb,
++					unsigned long action,
++					void *ignored);
++
++DEFINE_LED_TRIGGER(ledtrig_sleep)
++static struct notifier_block ledtrig_sleep_pm_notifier = {
++	.notifier_call = ledtrig_sleep_pm_callback,
++	.priority = 0,
++};
++
++static void ledtrig_sleep_early_suspend(struct early_suspend *h)
++{
++	led_trigger_event(ledtrig_sleep, LED_FULL);
++}
++
++static void ledtrig_sleep_early_resume(struct early_suspend *h)
++{
++	led_trigger_event(ledtrig_sleep, LED_OFF);
++}
++
++static struct early_suspend ledtrig_sleep_early_suspend_handler = {
++	.suspend = ledtrig_sleep_early_suspend,
++	.resume = ledtrig_sleep_early_resume,
++};
++
++static int ledtrig_sleep_pm_callback(struct notifier_block *nfb,
++					unsigned long action,
++					void *ignored)
++{
++	switch (action) {
++	case PM_HIBERNATION_PREPARE:
++	case PM_SUSPEND_PREPARE:
++		led_trigger_event(ledtrig_sleep, LED_OFF);
++		return NOTIFY_OK;
++	case PM_POST_HIBERNATION:
++	case PM_POST_SUSPEND:
++		led_trigger_event(ledtrig_sleep, LED_FULL);
++		return NOTIFY_OK;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static int __init ledtrig_sleep_init(void)
++{
++	led_trigger_register_simple("sleep", &ledtrig_sleep);
++	register_pm_notifier(&ledtrig_sleep_pm_notifier);
++	register_early_suspend(&ledtrig_sleep_early_suspend_handler);
++	return 0;
++}
++
++static void __exit ledtrig_sleep_exit(void)
++{
++	unregister_early_suspend(&ledtrig_sleep_early_suspend_handler);
++	unregister_pm_notifier(&ledtrig_sleep_pm_notifier);
++	led_trigger_unregister_simple(ledtrig_sleep);
++}
++
++module_init(ledtrig_sleep_init);
++module_exit(ledtrig_sleep_exit);
++

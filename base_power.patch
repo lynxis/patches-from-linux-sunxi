@@ -1,0 +1,1386 @@
+diff --git a/drivers/base/power/domain.c b/drivers/base/power/domain.c
+index 73ce9fb..83aa694 100644
+--- a/drivers/base/power/domain.c
++++ b/drivers/base/power/domain.c
+@@ -11,6 +11,7 @@
+ #include <linux/io.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/pm_domain.h>
++#include <linux/pm_qos.h>
+ #include <linux/slab.h>
+ #include <linux/err.h>
+ #include <linux/sched.h>
+@@ -38,11 +39,13 @@
+ 	ktime_t __start = ktime_get();						\
+ 	type __retval = GENPD_DEV_CALLBACK(genpd, type, callback, dev);		\
+ 	s64 __elapsed = ktime_to_ns(ktime_sub(ktime_get(), __start));		\
+-	struct generic_pm_domain_data *__gpd_data = dev_gpd_data(dev);		\
+-	if (__elapsed > __gpd_data->td.field) {					\
+-		__gpd_data->td.field = __elapsed;				\
++	struct gpd_timing_data *__td = &dev_gpd_data(dev)->td;			\
++	if (!__retval && __elapsed > __td->field) {				\
++		__td->field = __elapsed;					\
+ 		dev_warn(dev, name " latency exceeded, new value %lld ns\n",	\
+ 			__elapsed);						\
++		genpd->max_off_time_changed = true;				\
++		__td->constraint_changed = true;				\
+ 	}									\
+ 	__retval;								\
+ })
+@@ -211,6 +214,7 @@ int __pm_genpd_poweron(struct generic_pm_domain *genpd)
+ 		elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(), time_start));
+ 		if (elapsed_ns > genpd->power_on_latency_ns) {
+ 			genpd->power_on_latency_ns = elapsed_ns;
++			genpd->max_off_time_changed = true;
+ 			if (genpd->name)
+ 				pr_warning("%s: Power-on latency exceeded, "
+ 					"new value %lld ns\n", genpd->name,
+@@ -247,6 +251,53 @@ int pm_genpd_poweron(struct generic_pm_domain *genpd)
+ 
+ #ifdef CONFIG_PM_RUNTIME
+ 
++static int genpd_dev_pm_qos_notifier(struct notifier_block *nb,
++				     unsigned long val, void *ptr)
++{
++	struct generic_pm_domain_data *gpd_data;
++	struct device *dev;
++
++	gpd_data = container_of(nb, struct generic_pm_domain_data, nb);
++
++	mutex_lock(&gpd_data->lock);
++	dev = gpd_data->base.dev;
++	if (!dev) {
++		mutex_unlock(&gpd_data->lock);
++		return NOTIFY_DONE;
++	}
++	mutex_unlock(&gpd_data->lock);
++
++	for (;;) {
++		struct generic_pm_domain *genpd;
++		struct pm_domain_data *pdd;
++
++		spin_lock_irq(&dev->power.lock);
++
++		pdd = dev->power.subsys_data ?
++				dev->power.subsys_data->domain_data : NULL;
++		if (pdd) {
++			to_gpd_data(pdd)->td.constraint_changed = true;
++			genpd = dev_to_genpd(dev);
++		} else {
++			genpd = ERR_PTR(-ENODATA);
++		}
++
++		spin_unlock_irq(&dev->power.lock);
++
++		if (!IS_ERR(genpd)) {
++			mutex_lock(&genpd->lock);
++			genpd->max_off_time_changed = true;
++			mutex_unlock(&genpd->lock);
++		}
++
++		dev = dev->parent;
++		if (!dev || dev->power.ignore_children)
++			break;
++	}
++
++	return NOTIFY_DONE;
++}
++
+ /**
+  * __pm_genpd_save_device - Save the pre-suspend state of a device.
+  * @pdd: Domain data of the device to save the state of.
+@@ -435,6 +486,7 @@ static int pm_genpd_poweroff(struct generic_pm_domain *genpd)
+ 		elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(), time_start));
+ 		if (elapsed_ns > genpd->power_off_latency_ns) {
+ 			genpd->power_off_latency_ns = elapsed_ns;
++			genpd->max_off_time_changed = true;
+ 			if (genpd->name)
+ 				pr_warning("%s: Power-off latency exceeded, "
+ 					"new value %lld ns\n", genpd->name,
+@@ -443,17 +495,6 @@ static int pm_genpd_poweroff(struct generic_pm_domain *genpd)
+ 	}
+ 
+ 	genpd->status = GPD_STATE_POWER_OFF;
+-	genpd->power_off_time = ktime_get();
+-
+-	/* Update PM QoS information for devices in the domain. */
+-	list_for_each_entry_reverse(pdd, &genpd->dev_list, list_node) {
+-		struct gpd_timing_data *td = &to_gpd_data(pdd)->td;
+-
+-		pm_runtime_update_max_time_suspended(pdd->dev,
+-					td->start_latency_ns +
+-					td->restore_state_latency_ns +
+-					genpd->power_on_latency_ns);
+-	}
+ 
+ 	list_for_each_entry(link, &genpd->slave_links, slave_node) {
+ 		genpd_sd_counter_dec(link->master);
+@@ -514,9 +555,6 @@ static int pm_genpd_runtime_suspend(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	pm_runtime_update_max_time_suspended(dev,
+-				dev_gpd_data(dev)->td.start_latency_ns);
+-
+ 	/*
+ 	 * If power.irq_safe is set, this routine will be run with interrupts
+ 	 * off, so it can't use mutexes.
+@@ -613,6 +651,12 @@ void pm_genpd_poweroff_unused(void)
+ 
+ #else
+ 
++static inline int genpd_dev_pm_qos_notifier(struct notifier_block *nb,
++					    unsigned long val, void *ptr)
++{
++	return NOTIFY_DONE;
++}
++
+ static inline void genpd_power_off_work_fn(struct work_struct *work) {}
+ 
+ #define pm_genpd_runtime_suspend	NULL
+@@ -1209,12 +1253,15 @@ int __pm_genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
+ 	if (IS_ERR_OR_NULL(genpd) || IS_ERR_OR_NULL(dev))
+ 		return -EINVAL;
+ 
+-	genpd_acquire_lock(genpd);
++	gpd_data = kzalloc(sizeof(*gpd_data), GFP_KERNEL);
++	if (!gpd_data)
++		return -ENOMEM;
+ 
+-	if (genpd->status == GPD_STATE_POWER_OFF) {
+-		ret = -EINVAL;
+-		goto out;
+-	}
++	mutex_init(&gpd_data->lock);
++	gpd_data->nb.notifier_call = genpd_dev_pm_qos_notifier;
++	dev_pm_qos_add_notifier(dev, &gpd_data->nb);
++
++	genpd_acquire_lock(genpd);
+ 
+ 	if (genpd->prepared_count > 0) {
+ 		ret = -EAGAIN;
+@@ -1227,26 +1274,35 @@ int __pm_genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
+ 			goto out;
+ 		}
+ 
+-	gpd_data = kzalloc(sizeof(*gpd_data), GFP_KERNEL);
+-	if (!gpd_data) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+-
+ 	genpd->device_count++;
++	genpd->max_off_time_changed = true;
+ 
+-	dev->pm_domain = &genpd->domain;
+ 	dev_pm_get_subsys_data(dev);
++
++	mutex_lock(&gpd_data->lock);
++	spin_lock_irq(&dev->power.lock);
++	dev->pm_domain = &genpd->domain;
+ 	dev->power.subsys_data->domain_data = &gpd_data->base;
+ 	gpd_data->base.dev = dev;
+-	gpd_data->need_restore = false;
+ 	list_add_tail(&gpd_data->base.list_node, &genpd->dev_list);
++	gpd_data->need_restore = genpd->status == GPD_STATE_POWER_OFF;
+ 	if (td)
+ 		gpd_data->td = *td;
+ 
++	gpd_data->td.constraint_changed = true;
++	gpd_data->td.effective_constraint_ns = -1;
++	spin_unlock_irq(&dev->power.lock);
++	mutex_unlock(&gpd_data->lock);
++
++	genpd_release_lock(genpd);
++
++	return 0;
++
+  out:
+ 	genpd_release_lock(genpd);
+ 
++	dev_pm_qos_remove_notifier(dev, &gpd_data->nb);
++	kfree(gpd_data);
+ 	return ret;
+ }
+ 
+@@ -1290,12 +1346,15 @@ int __pm_genpd_of_add_device(struct device_node *genpd_node, struct device *dev,
+ int pm_genpd_remove_device(struct generic_pm_domain *genpd,
+ 			   struct device *dev)
+ {
++	struct generic_pm_domain_data *gpd_data;
+ 	struct pm_domain_data *pdd;
+-	int ret = -EINVAL;
++	int ret = 0;
+ 
+ 	dev_dbg(dev, "%s()\n", __func__);
+ 
+-	if (IS_ERR_OR_NULL(genpd) || IS_ERR_OR_NULL(dev))
++	if (IS_ERR_OR_NULL(genpd) || IS_ERR_OR_NULL(dev)
++	    ||  IS_ERR_OR_NULL(dev->pm_domain)
++	    ||  pd_to_genpd(dev->pm_domain) != genpd)
+ 		return -EINVAL;
+ 
+ 	genpd_acquire_lock(genpd);
+@@ -1305,21 +1364,27 @@ int pm_genpd_remove_device(struct generic_pm_domain *genpd,
+ 		goto out;
+ 	}
+ 
+-	list_for_each_entry(pdd, &genpd->dev_list, list_node) {
+-		if (pdd->dev != dev)
+-			continue;
++	genpd->device_count--;
++	genpd->max_off_time_changed = true;
+ 
+-		list_del_init(&pdd->list_node);
+-		pdd->dev = NULL;
+-		dev_pm_put_subsys_data(dev);
+-		dev->pm_domain = NULL;
+-		kfree(to_gpd_data(pdd));
++	spin_lock_irq(&dev->power.lock);
++	dev->pm_domain = NULL;
++	pdd = dev->power.subsys_data->domain_data;
++	list_del_init(&pdd->list_node);
++	dev->power.subsys_data->domain_data = NULL;
++	spin_unlock_irq(&dev->power.lock);
+ 
+-		genpd->device_count--;
++	gpd_data = to_gpd_data(pdd);
++	mutex_lock(&gpd_data->lock);
++	pdd->dev = NULL;
++	mutex_unlock(&gpd_data->lock);
+ 
+-		ret = 0;
+-		break;
+-	}
++	genpd_release_lock(genpd);
++
++	dev_pm_qos_remove_notifier(dev, &gpd_data->nb);
++	kfree(gpd_data);
++	dev_pm_put_subsys_data(dev);
++	return 0;
+ 
+  out:
+ 	genpd_release_lock(genpd);
+@@ -1348,6 +1413,26 @@ void pm_genpd_dev_always_on(struct device *dev, bool val)
+ EXPORT_SYMBOL_GPL(pm_genpd_dev_always_on);
+ 
+ /**
++ * pm_genpd_dev_need_restore - Set/unset the device's "need restore" flag.
++ * @dev: Device to set/unset the flag for.
++ * @val: The new value of the device's "need restore" flag.
++ */
++void pm_genpd_dev_need_restore(struct device *dev, bool val)
++{
++	struct pm_subsys_data *psd;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->power.lock, flags);
++
++	psd = dev_to_psd(dev);
++	if (psd && psd->domain_data)
++		to_gpd_data(psd->domain_data)->need_restore = val;
++
++	spin_unlock_irqrestore(&dev->power.lock, flags);
++}
++EXPORT_SYMBOL_GPL(pm_genpd_dev_need_restore);
++
++/**
+  * pm_genpd_add_subdomain - Add a subdomain to an I/O PM domain.
+  * @genpd: Master PM domain to add the subdomain to.
+  * @subdomain: Subdomain to be added.
+@@ -1378,7 +1463,7 @@ int pm_genpd_add_subdomain(struct generic_pm_domain *genpd,
+ 		goto out;
+ 	}
+ 
+-	list_for_each_entry(link, &genpd->slave_links, slave_node) {
++	list_for_each_entry(link, &genpd->master_links, master_node) {
+ 		if (link->slave == subdomain && link->master == genpd) {
+ 			ret = -EINVAL;
+ 			goto out;
+@@ -1690,6 +1775,7 @@ void pm_genpd_init(struct generic_pm_domain *genpd,
+ 	genpd->resume_count = 0;
+ 	genpd->device_count = 0;
+ 	genpd->max_off_time_ns = -1;
++	genpd->max_off_time_changed = true;
+ 	genpd->domain.ops.runtime_suspend = pm_genpd_runtime_suspend;
+ 	genpd->domain.ops.runtime_resume = pm_genpd_runtime_resume;
+ 	genpd->domain.ops.runtime_idle = pm_generic_runtime_idle;
+diff --git a/drivers/base/power/domain_governor.c b/drivers/base/power/domain_governor.c
+index 66a265b..28dee30 100644
+--- a/drivers/base/power/domain_governor.c
++++ b/drivers/base/power/domain_governor.c
+@@ -14,6 +14,31 @@
+ 
+ #ifdef CONFIG_PM_RUNTIME
+ 
++static int dev_update_qos_constraint(struct device *dev, void *data)
++{
++	s64 *constraint_ns_p = data;
++	s32 constraint_ns = -1;
++
++	if (dev->power.subsys_data && dev->power.subsys_data->domain_data)
++		constraint_ns = dev_gpd_data(dev)->td.effective_constraint_ns;
++
++	if (constraint_ns < 0) {
++		constraint_ns = dev_pm_qos_read_value(dev);
++		constraint_ns *= NSEC_PER_USEC;
++	}
++	if (constraint_ns == 0)
++		return 0;
++
++	/*
++	 * constraint_ns cannot be negative here, because the device has been
++	 * suspended.
++	 */
++	if (constraint_ns < *constraint_ns_p || *constraint_ns_p == 0)
++		*constraint_ns_p = constraint_ns;
++
++	return 0;
++}
++
+ /**
+  * default_stop_ok - Default PM domain governor routine for stopping devices.
+  * @dev: Device to check.
+@@ -21,14 +46,52 @@
+ bool default_stop_ok(struct device *dev)
+ {
+ 	struct gpd_timing_data *td = &dev_gpd_data(dev)->td;
++	unsigned long flags;
++	s64 constraint_ns;
+ 
+ 	dev_dbg(dev, "%s()\n", __func__);
+ 
+-	if (dev->power.max_time_suspended_ns < 0 || td->break_even_ns == 0)
+-		return true;
++	spin_lock_irqsave(&dev->power.lock, flags);
++
++	if (!td->constraint_changed) {
++		bool ret = td->cached_stop_ok;
+ 
+-	return td->stop_latency_ns + td->start_latency_ns < td->break_even_ns
+-		&& td->break_even_ns < dev->power.max_time_suspended_ns;
++		spin_unlock_irqrestore(&dev->power.lock, flags);
++		return ret;
++	}
++	td->constraint_changed = false;
++	td->cached_stop_ok = false;
++	td->effective_constraint_ns = -1;
++	constraint_ns = __dev_pm_qos_read_value(dev);
++
++	spin_unlock_irqrestore(&dev->power.lock, flags);
++
++	if (constraint_ns < 0)
++		return false;
++
++	constraint_ns *= NSEC_PER_USEC;
++	/*
++	 * We can walk the children without any additional locking, because
++	 * they all have been suspended at this point and their
++	 * effective_constraint_ns fields won't be modified in parallel with us.
++	 */
++	if (!dev->power.ignore_children)
++		device_for_each_child(dev, &constraint_ns,
++				      dev_update_qos_constraint);
++
++	if (constraint_ns > 0) {
++		constraint_ns -= td->start_latency_ns;
++		if (constraint_ns == 0)
++			return false;
++	}
++	td->effective_constraint_ns = constraint_ns;
++	td->cached_stop_ok = constraint_ns > td->stop_latency_ns ||
++				constraint_ns == 0;
++	/*
++	 * The children have been suspended already, so we don't need to take
++	 * their stop latencies into account here.
++	 */
++	return td->cached_stop_ok;
+ }
+ 
+ /**
+@@ -42,9 +105,27 @@ static bool default_power_down_ok(struct dev_pm_domain *pd)
+ 	struct generic_pm_domain *genpd = pd_to_genpd(pd);
+ 	struct gpd_link *link;
+ 	struct pm_domain_data *pdd;
+-	s64 min_dev_off_time_ns;
++	s64 min_off_time_ns;
+ 	s64 off_on_time_ns;
+-	ktime_t time_now = ktime_get();
++
++	if (genpd->max_off_time_changed) {
++		struct gpd_link *link;
++
++		/*
++		 * We have to invalidate the cached results for the masters, so
++		 * use the observation that default_power_down_ok() is not
++		 * going to be called for any master until this instance
++		 * returns.
++		 */
++		list_for_each_entry(link, &genpd->slave_links, slave_node)
++			link->master->max_off_time_changed = true;
++
++		genpd->max_off_time_changed = false;
++		genpd->cached_power_down_ok = false;
++		genpd->max_off_time_ns = -1;
++	} else {
++		return genpd->cached_power_down_ok;
++	}
+ 
+ 	off_on_time_ns = genpd->power_off_latency_ns +
+ 				genpd->power_on_latency_ns;
+@@ -61,6 +142,7 @@ static bool default_power_down_ok(struct dev_pm_domain *pd)
+ 				to_gpd_data(pdd)->td.save_state_latency_ns;
+ 	}
+ 
++	min_off_time_ns = -1;
+ 	/*
+ 	 * Check if subdomains can be off for enough time.
+ 	 *
+@@ -73,8 +155,6 @@ static bool default_power_down_ok(struct dev_pm_domain *pd)
+ 		if (sd_max_off_ns < 0)
+ 			continue;
+ 
+-		sd_max_off_ns -= ktime_to_ns(ktime_sub(time_now,
+-						       sd->power_off_time));
+ 		/*
+ 		 * Check if the subdomain is allowed to be off long enough for
+ 		 * the current domain to turn off and on (that's how much time
+@@ -82,60 +162,64 @@ static bool default_power_down_ok(struct dev_pm_domain *pd)
+ 		 */
+ 		if (sd_max_off_ns <= off_on_time_ns)
+ 			return false;
++
++		if (min_off_time_ns > sd_max_off_ns || min_off_time_ns < 0)
++			min_off_time_ns = sd_max_off_ns;
+ 	}
+ 
+ 	/*
+ 	 * Check if the devices in the domain can be off enough time.
+ 	 */
+-	min_dev_off_time_ns = -1;
+ 	list_for_each_entry(pdd, &genpd->dev_list, list_node) {
+ 		struct gpd_timing_data *td;
+-		struct device *dev = pdd->dev;
+-		s64 dev_off_time_ns;
++		s64 constraint_ns;
+ 
+-		if (!dev->driver || dev->power.max_time_suspended_ns < 0)
++		if (!pdd->dev->driver)
+ 			continue;
+ 
++		/*
++		 * Check if the device is allowed to be off long enough for the
++		 * domain to turn off and on (that's how much time it will
++		 * have to wait worst case).
++		 */
+ 		td = &to_gpd_data(pdd)->td;
+-		dev_off_time_ns = dev->power.max_time_suspended_ns -
+-			(td->start_latency_ns + td->restore_state_latency_ns +
+-				ktime_to_ns(ktime_sub(time_now,
+-						dev->power.suspend_time)));
+-		if (dev_off_time_ns <= off_on_time_ns)
+-			return false;
+-
+-		if (min_dev_off_time_ns > dev_off_time_ns
+-		    || min_dev_off_time_ns < 0)
+-			min_dev_off_time_ns = dev_off_time_ns;
+-	}
++		constraint_ns = td->effective_constraint_ns;
++		/* default_stop_ok() need not be called before us. */
++		if (constraint_ns < 0) {
++			constraint_ns = dev_pm_qos_read_value(pdd->dev);
++			constraint_ns *= NSEC_PER_USEC;
++		}
++		if (constraint_ns == 0)
++			continue;
+ 
+-	if (min_dev_off_time_ns < 0) {
+ 		/*
+-		 * There are no latency constraints, so the domain can spend
+-		 * arbitrary time in the "off" state.
++		 * constraint_ns cannot be negative here, because the device has
++		 * been suspended.
+ 		 */
+-		genpd->max_off_time_ns = -1;
+-		return true;
++		constraint_ns -= td->restore_state_latency_ns;
++		if (constraint_ns <= off_on_time_ns)
++			return false;
++
++		if (min_off_time_ns > constraint_ns || min_off_time_ns < 0)
++			min_off_time_ns = constraint_ns;
+ 	}
+ 
++	genpd->cached_power_down_ok = true;
++
+ 	/*
+-	 * The difference between the computed minimum delta and the time needed
+-	 * to turn the domain on is the maximum theoretical time this domain can
+-	 * spend in the "off" state.
++	 * If the computed minimum device off time is negative, there are no
++	 * latency constraints, so the domain can spend arbitrary time in the
++	 * "off" state.
+ 	 */
+-	min_dev_off_time_ns -= genpd->power_on_latency_ns;
++	if (min_off_time_ns < 0)
++		return true;
+ 
+ 	/*
+-	 * If the difference between the computed minimum delta and the time
+-	 * needed to turn the domain off and back on on is smaller than the
+-	 * domain's power break even time, removing power from the domain is not
+-	 * worth it.
++	 * The difference between the computed minimum subdomain or device off
++	 * time and the time needed to turn the domain on is the maximum
++	 * theoretical time this domain can spend in the "off" state.
+ 	 */
+-	if (genpd->break_even_ns >
+-	    min_dev_off_time_ns - genpd->power_off_latency_ns)
+-		return false;
+-
+-	genpd->max_off_time_ns = min_dev_off_time_ns;
++	genpd->max_off_time_ns = min_off_time_ns - genpd->power_on_latency_ns;
+ 	return true;
+ }
+ 
+diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
+index ebc272f..77e3b97 100644
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -28,6 +28,7 @@
+ #include <linux/sched.h>
+ #include <linux/async.h>
+ #include <linux/suspend.h>
++#include <linux/timer.h>
+ 
+ #include "../base.h"
+ #include "power.h"
+@@ -54,6 +55,12 @@ struct suspend_stats suspend_stats;
+ static DEFINE_MUTEX(dpm_list_mtx);
+ static pm_message_t pm_transition;
+ 
++struct dpm_watchdog {
++	struct device		*dev;
++	struct task_struct	*tsk;
++	struct timer_list	timer;
++};
++
+ static int async_error;
+ 
+ /**
+@@ -389,6 +396,56 @@ static int dpm_run_callback(pm_callback_t cb, struct device *dev,
+ 	return error;
+ }
+ 
++/**
++ * dpm_wd_handler - Driver suspend / resume watchdog handler.
++ *
++ * Called when a driver has timed out suspending or resuming.
++ * There's not much we can do here to recover so BUG() out for
++ * a crash-dump
++ */
++static void dpm_wd_handler(unsigned long data)
++{
++	struct dpm_watchdog *wd = (void *)data;
++	struct device *dev      = wd->dev;
++	struct task_struct *tsk = wd->tsk;
++
++	dev_emerg(dev, "**** DPM device timeout ****\n");
++	show_stack(tsk, NULL);
++
++	BUG();
++}
++
++/**
++ * dpm_wd_set - Enable pm watchdog for given device.
++ * @wd: Watchdog. Must be allocated on the stack.
++ * @dev: Device to handle.
++ */
++static void dpm_wd_set(struct dpm_watchdog *wd, struct device *dev)
++{
++	struct timer_list *timer = &wd->timer;
++
++	wd->dev = dev;
++	wd->tsk = get_current();
++
++	init_timer_on_stack(timer);
++	timer->expires = jiffies + HZ * 12;
++	timer->function = dpm_wd_handler;
++	timer->data = (unsigned long)wd;
++	add_timer(timer);
++}
++
++/**
++ * dpm_wd_clear - Disable pm watchdog.
++ * @wd: Watchdog to disable.
++ */
++static void dpm_wd_clear(struct dpm_watchdog *wd)
++{
++	struct timer_list *timer = &wd->timer;
++
++	del_timer_sync(timer);
++	destroy_timer_on_stack(timer);
++}
++
+ /*------------------------- Resume routines -------------------------*/
+ 
+ /**
+@@ -565,6 +622,7 @@ static int device_resume(struct device *dev, pm_message_t state, bool async)
+ 	char *info = NULL;
+ 	int error = 0;
+ 	bool put = false;
++	struct dpm_watchdog wd;
+ 
+ 	TRACE_DEVICE(dev);
+ 	TRACE_RESUME(0);
+@@ -577,6 +635,7 @@ static int device_resume(struct device *dev, pm_message_t state, bool async)
+ 	 * a resumed device, even if the device hasn't been completed yet.
+ 	 */
+ 	dev->power.is_prepared = false;
++	dpm_wd_set(&wd, dev);
+ 
+ 	if (!dev->power.is_suspended)
+ 		goto Unlock;
+@@ -631,6 +690,7 @@ static int device_resume(struct device *dev, pm_message_t state, bool async)
+ 
+  Unlock:
+ 	device_unlock(dev);
++	dpm_wd_clear(&wd);
+ 	complete_all(&dev->power.completion);
+ 
+ 	TRACE_RESUME(error);
+@@ -889,6 +949,11 @@ static int dpm_suspend_noirq(pm_message_t state)
+ 		if (!list_empty(&dev->power.entry))
+ 			list_move(&dev->power.entry, &dpm_noirq_list);
+ 		put_device(dev);
++
++		if (pm_wakeup_pending()) {
++			error = -EBUSY;
++			break;
++		}
+ 	}
+ 	mutex_unlock(&dpm_list_mtx);
+ 	if (error)
+@@ -962,6 +1027,11 @@ static int dpm_suspend_late(pm_message_t state)
+ 		if (!list_empty(&dev->power.entry))
+ 			list_move(&dev->power.entry, &dpm_late_early_list);
+ 		put_device(dev);
++
++		if (pm_wakeup_pending()) {
++			error = -EBUSY;
++			break;
++		}
+ 	}
+ 	mutex_unlock(&dpm_list_mtx);
+ 	if (error)
+@@ -1025,6 +1095,7 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
+ 	pm_callback_t callback = NULL;
+ 	char *info = NULL;
+ 	int error = 0;
++	struct dpm_watchdog wd;
+ 
+ 	dpm_wait_for_children(dev, async);
+ 
+@@ -1041,6 +1112,8 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
+ 		goto Complete;
+ 	}
+ 
++	dpm_wd_set(&wd, dev);
++
+ 	device_lock(dev);
+ 
+ 	if (dev->pm_domain) {
+@@ -1096,6 +1169,8 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
+ 
+ 	device_unlock(dev);
+ 
++	dpm_wd_clear(&wd);
++
+  Complete:
+ 	complete_all(&dev->power.completion);
+ 
+diff --git a/drivers/base/power/qos.c b/drivers/base/power/qos.c
+index c365c93..b95ebf2 100644
+--- a/drivers/base/power/qos.c
++++ b/drivers/base/power/qos.c
+@@ -352,21 +352,26 @@ EXPORT_SYMBOL_GPL(dev_pm_qos_remove_request);
+  *
+  * Will register the notifier into a notification chain that gets called
+  * upon changes to the target value for the device.
++ *
++ * If the device's constraints object doesn't exist when this routine is called,
++ * it will be created (or error code will be returned if that fails).
+  */
+ int dev_pm_qos_add_notifier(struct device *dev, struct notifier_block *notifier)
+ {
+-	int retval = 0;
++	int ret = 0;
+ 
+ 	mutex_lock(&dev_pm_qos_mtx);
+ 
+-	/* Silently return if the constraints object is not present. */
+-	if (dev->power.constraints)
+-		retval = blocking_notifier_chain_register(
+-				dev->power.constraints->notifiers,
+-				notifier);
++	if (!dev->power.constraints)
++		ret = dev->power.power_state.event != PM_EVENT_INVALID ?
++			dev_pm_qos_constraints_allocate(dev) : -ENODEV;
++
++	if (!ret)
++		ret = blocking_notifier_chain_register(
++				dev->power.constraints->notifiers, notifier);
+ 
+ 	mutex_unlock(&dev_pm_qos_mtx);
+-	return retval;
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(dev_pm_qos_add_notifier);
+ 
+diff --git a/drivers/base/power/runtime.c b/drivers/base/power/runtime.c
+index bb82b18..b6e9d9b 100644
+--- a/drivers/base/power/runtime.c
++++ b/drivers/base/power/runtime.c
+@@ -282,47 +282,6 @@ static int rpm_callback(int (*cb)(struct device *), struct device *dev)
+ 	return retval != -EACCES ? retval : -EIO;
+ }
+ 
+-struct rpm_qos_data {
+-	ktime_t time_now;
+-	s64 constraint_ns;
+-};
+-
+-/**
+- * rpm_update_qos_constraint - Update a given PM QoS constraint data.
+- * @dev: Device whose timing data to use.
+- * @data: PM QoS constraint data to update.
+- *
+- * Use the suspend timing data of @dev to update PM QoS constraint data pointed
+- * to by @data.
+- */
+-static int rpm_update_qos_constraint(struct device *dev, void *data)
+-{
+-	struct rpm_qos_data *qos = data;
+-	unsigned long flags;
+-	s64 delta_ns;
+-	int ret = 0;
+-
+-	spin_lock_irqsave(&dev->power.lock, flags);
+-
+-	if (dev->power.max_time_suspended_ns < 0)
+-		goto out;
+-
+-	delta_ns = dev->power.max_time_suspended_ns -
+-		ktime_to_ns(ktime_sub(qos->time_now, dev->power.suspend_time));
+-	if (delta_ns <= 0) {
+-		ret = -EBUSY;
+-		goto out;
+-	}
+-
+-	if (qos->constraint_ns > delta_ns || qos->constraint_ns == 0)
+-		qos->constraint_ns = delta_ns;
+-
+- out:
+-	spin_unlock_irqrestore(&dev->power.lock, flags);
+-
+-	return ret;
+-}
+-
+ /**
+  * rpm_suspend - Carry out runtime suspend of given device.
+  * @dev: Device to suspend.
+@@ -349,7 +308,6 @@ static int rpm_suspend(struct device *dev, int rpmflags)
+ {
+ 	int (*callback)(struct device *);
+ 	struct device *parent = NULL;
+-	struct rpm_qos_data qos;
+ 	int retval;
+ 
+ 	trace_rpm_suspend(dev, rpmflags);
+@@ -444,38 +402,14 @@ static int rpm_suspend(struct device *dev, int rpmflags)
+ 		goto out;
+ 	}
+ 
+-	qos.constraint_ns = __dev_pm_qos_read_value(dev);
+-	if (qos.constraint_ns < 0) {
+-		/* Negative constraint means "never suspend". */
++	if (__dev_pm_qos_read_value(dev) < 0) {
++		/* Negative PM QoS constraint means "never suspend". */
+ 		retval = -EPERM;
+ 		goto out;
+ 	}
+-	qos.constraint_ns *= NSEC_PER_USEC;
+-	qos.time_now = ktime_get();
+ 
+ 	__update_runtime_status(dev, RPM_SUSPENDING);
+ 
+-	if (!dev->power.ignore_children) {
+-		if (dev->power.irq_safe)
+-			spin_unlock(&dev->power.lock);
+-		else
+-			spin_unlock_irq(&dev->power.lock);
+-
+-		retval = device_for_each_child(dev, &qos,
+-					       rpm_update_qos_constraint);
+-
+-		if (dev->power.irq_safe)
+-			spin_lock(&dev->power.lock);
+-		else
+-			spin_lock_irq(&dev->power.lock);
+-
+-		if (retval)
+-			goto fail;
+-	}
+-
+-	dev->power.suspend_time = qos.time_now;
+-	dev->power.max_time_suspended_ns = qos.constraint_ns ? : -1;
+-
+ 	if (dev->pm_domain)
+ 		callback = dev->pm_domain->ops.runtime_suspend;
+ 	else if (dev->type && dev->type->pm)
+@@ -529,8 +463,6 @@ static int rpm_suspend(struct device *dev, int rpmflags)
+ 
+  fail:
+ 	__update_runtime_status(dev, RPM_ACTIVE);
+-	dev->power.suspend_time = ktime_set(0, 0);
+-	dev->power.max_time_suspended_ns = -1;
+ 	dev->power.deferred_resume = false;
+ 	wake_up_all(&dev->power.wait_queue);
+ 
+@@ -705,9 +637,6 @@ static int rpm_resume(struct device *dev, int rpmflags)
+ 	if (dev->power.no_callbacks)
+ 		goto no_callback;	/* Assume success. */
+ 
+-	dev->power.suspend_time = ktime_set(0, 0);
+-	dev->power.max_time_suspended_ns = -1;
+-
+ 	__update_runtime_status(dev, RPM_RESUMING);
+ 
+ 	if (dev->pm_domain)
+@@ -1370,9 +1299,6 @@ void pm_runtime_init(struct device *dev)
+ 	setup_timer(&dev->power.suspend_timer, pm_suspend_timer_fn,
+ 			(unsigned long)dev);
+ 
+-	dev->power.suspend_time = ktime_set(0, 0);
+-	dev->power.max_time_suspended_ns = -1;
+-
+ 	init_waitqueue_head(&dev->power.wait_queue);
+ }
+ 
+@@ -1390,28 +1316,3 @@ void pm_runtime_remove(struct device *dev)
+ 	if (dev->power.irq_safe && dev->parent)
+ 		pm_runtime_put_sync(dev->parent);
+ }
+-
+-/**
+- * pm_runtime_update_max_time_suspended - Update device's suspend time data.
+- * @dev: Device to handle.
+- * @delta_ns: Value to subtract from the device's max_time_suspended_ns field.
+- *
+- * Update the device's power.max_time_suspended_ns field by subtracting
+- * @delta_ns from it.  The resulting value of power.max_time_suspended_ns is
+- * never negative.
+- */
+-void pm_runtime_update_max_time_suspended(struct device *dev, s64 delta_ns)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&dev->power.lock, flags);
+-
+-	if (delta_ns > 0 && dev->power.max_time_suspended_ns > 0) {
+-		if (dev->power.max_time_suspended_ns > delta_ns)
+-			dev->power.max_time_suspended_ns -= delta_ns;
+-		else
+-			dev->power.max_time_suspended_ns = 0;
+-	}
+-
+-	spin_unlock_irqrestore(&dev->power.lock, flags);
+-}
+diff --git a/drivers/base/power/sysfs.c b/drivers/base/power/sysfs.c
+index 95c12f6..48be2ad 100644
+--- a/drivers/base/power/sysfs.c
++++ b/drivers/base/power/sysfs.c
+@@ -314,22 +314,41 @@ static ssize_t wakeup_active_count_show(struct device *dev,
+ 
+ static DEVICE_ATTR(wakeup_active_count, 0444, wakeup_active_count_show, NULL);
+ 
+-static ssize_t wakeup_hit_count_show(struct device *dev,
+-				struct device_attribute *attr, char *buf)
++static ssize_t wakeup_abort_count_show(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
++{
++	unsigned long count = 0;
++	bool enabled = false;
++
++	spin_lock_irq(&dev->power.lock);
++	if (dev->power.wakeup) {
++		count = dev->power.wakeup->wakeup_count;
++		enabled = true;
++	}
++	spin_unlock_irq(&dev->power.lock);
++	return enabled ? sprintf(buf, "%lu\n", count) : sprintf(buf, "\n");
++}
++
++static DEVICE_ATTR(wakeup_abort_count, 0444, wakeup_abort_count_show, NULL);
++
++static ssize_t wakeup_expire_count_show(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
+ {
+ 	unsigned long count = 0;
+ 	bool enabled = false;
+ 
+ 	spin_lock_irq(&dev->power.lock);
+ 	if (dev->power.wakeup) {
+-		count = dev->power.wakeup->hit_count;
++		count = dev->power.wakeup->expire_count;
+ 		enabled = true;
+ 	}
+ 	spin_unlock_irq(&dev->power.lock);
+ 	return enabled ? sprintf(buf, "%lu\n", count) : sprintf(buf, "\n");
+ }
+ 
+-static DEVICE_ATTR(wakeup_hit_count, 0444, wakeup_hit_count_show, NULL);
++static DEVICE_ATTR(wakeup_expire_count, 0444, wakeup_expire_count_show, NULL);
+ 
+ static ssize_t wakeup_active_show(struct device *dev,
+ 				struct device_attribute *attr, char *buf)
+@@ -398,6 +417,27 @@ static ssize_t wakeup_last_time_show(struct device *dev,
+ }
+ 
+ static DEVICE_ATTR(wakeup_last_time_ms, 0444, wakeup_last_time_show, NULL);
++
++#ifdef CONFIG_PM_AUTOSLEEP
++static ssize_t wakeup_prevent_sleep_time_show(struct device *dev,
++					      struct device_attribute *attr,
++					      char *buf)
++{
++	s64 msec = 0;
++	bool enabled = false;
++
++	spin_lock_irq(&dev->power.lock);
++	if (dev->power.wakeup) {
++		msec = ktime_to_ms(dev->power.wakeup->prevent_sleep_time);
++		enabled = true;
++	}
++	spin_unlock_irq(&dev->power.lock);
++	return enabled ? sprintf(buf, "%lld\n", msec) : sprintf(buf, "\n");
++}
++
++static DEVICE_ATTR(wakeup_prevent_sleep_time_ms, 0444,
++		   wakeup_prevent_sleep_time_show, NULL);
++#endif /* CONFIG_PM_AUTOSLEEP */
+ #endif /* CONFIG_PM_SLEEP */
+ 
+ #ifdef CONFIG_PM_ADVANCED_DEBUG
+@@ -486,11 +526,15 @@ static struct attribute *wakeup_attrs[] = {
+ 	&dev_attr_wakeup.attr,
+ 	&dev_attr_wakeup_count.attr,
+ 	&dev_attr_wakeup_active_count.attr,
+-	&dev_attr_wakeup_hit_count.attr,
++	&dev_attr_wakeup_abort_count.attr,
++	&dev_attr_wakeup_expire_count.attr,
+ 	&dev_attr_wakeup_active.attr,
+ 	&dev_attr_wakeup_total_time_ms.attr,
+ 	&dev_attr_wakeup_max_time_ms.attr,
+ 	&dev_attr_wakeup_last_time_ms.attr,
++#ifdef CONFIG_PM_AUTOSLEEP
++	&dev_attr_wakeup_prevent_sleep_time_ms.attr,
++#endif
+ #endif
+ 	NULL,
+ };
+diff --git a/drivers/base/power/wakeup.c b/drivers/base/power/wakeup.c
+index 2a3e581..e6ee5e8 100644
+--- a/drivers/base/power/wakeup.c
++++ b/drivers/base/power/wakeup.c
+@@ -14,16 +14,15 @@
+ #include <linux/suspend.h>
+ #include <linux/seq_file.h>
+ #include <linux/debugfs.h>
++#include <trace/events/power.h>
+ 
+ #include "power.h"
+ 
+-#define TIMEOUT		100
+-
+ /*
+  * If set, the suspend/hibernate code will abort transitions to a sleep state
+  * if wakeup events are registered during or immediately before the transition.
+  */
+-bool events_check_enabled;
++bool events_check_enabled __read_mostly;
+ 
+ /*
+  * Combined counters of registered wakeup events and wakeup events in progress.
+@@ -52,6 +51,8 @@ static void pm_wakeup_timer_fn(unsigned long data);
+ 
+ static LIST_HEAD(wakeup_sources);
+ 
++static DECLARE_WAIT_QUEUE_HEAD(wakeup_count_wait_queue);
++
+ /**
+  * wakeup_source_prepare - Prepare a new wakeup source for initialization.
+  * @ws: Wakeup source to prepare.
+@@ -126,16 +127,19 @@ EXPORT_SYMBOL_GPL(wakeup_source_destroy);
+  */
+ void wakeup_source_add(struct wakeup_source *ws)
+ {
++	unsigned long flags;
++
+ 	if (WARN_ON(!ws))
+ 		return;
+ 
+ 	spin_lock_init(&ws->lock);
+ 	setup_timer(&ws->timer, pm_wakeup_timer_fn, (unsigned long)ws);
+ 	ws->active = false;
++	ws->last_time = ktime_get();
+ 
+-	spin_lock_irq(&events_lock);
++	spin_lock_irqsave(&events_lock, flags);
+ 	list_add_rcu(&ws->entry, &wakeup_sources);
+-	spin_unlock_irq(&events_lock);
++	spin_unlock_irqrestore(&events_lock, flags);
+ }
+ EXPORT_SYMBOL_GPL(wakeup_source_add);
+ 
+@@ -145,12 +149,14 @@ EXPORT_SYMBOL_GPL(wakeup_source_add);
+  */
+ void wakeup_source_remove(struct wakeup_source *ws)
+ {
++	unsigned long flags;
++
+ 	if (WARN_ON(!ws))
+ 		return;
+ 
+-	spin_lock_irq(&events_lock);
++	spin_lock_irqsave(&events_lock, flags);
+ 	list_del_rcu(&ws->entry);
+-	spin_unlock_irq(&events_lock);
++	spin_unlock_irqrestore(&events_lock, flags);
+ 	synchronize_rcu();
+ }
+ EXPORT_SYMBOL_GPL(wakeup_source_remove);
+@@ -374,12 +380,33 @@ EXPORT_SYMBOL_GPL(device_set_wakeup_enable);
+  */
+ static void wakeup_source_activate(struct wakeup_source *ws)
+ {
++	unsigned int cec;
++
+ 	ws->active = true;
+ 	ws->active_count++;
+ 	ws->last_time = ktime_get();
++	if (ws->autosleep_enabled)
++		ws->start_prevent_time = ws->last_time;
+ 
+ 	/* Increment the counter of events in progress. */
+-	atomic_inc(&combined_event_count);
++	cec = atomic_inc_return(&combined_event_count);
++
++	trace_wakeup_source_activate(ws->name, cec);
++}
++
++/**
++ * wakeup_source_report_event - Report wakeup event using the given source.
++ * @ws: Wakeup source to report the event for.
++ */
++static void wakeup_source_report_event(struct wakeup_source *ws)
++{
++	ws->event_count++;
++	/* This is racy, but the counter is approximate anyway. */
++	if (events_check_enabled)
++		ws->wakeup_count++;
++
++	if (!ws->active)
++		wakeup_source_activate(ws);
+ }
+ 
+ /**
+@@ -397,10 +424,7 @@ void __pm_stay_awake(struct wakeup_source *ws)
+ 
+ 	spin_lock_irqsave(&ws->lock, flags);
+ 
+-	ws->event_count++;
+-	if (!ws->active)
+-		wakeup_source_activate(ws);
+-
++	wakeup_source_report_event(ws);
+ 	del_timer(&ws->timer);
+ 	ws->timer_expires = 0;
+ 
+@@ -432,6 +456,17 @@ void pm_stay_awake(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(pm_stay_awake);
+ 
++#ifdef CONFIG_PM_AUTOSLEEP
++static void update_prevent_sleep_time(struct wakeup_source *ws, ktime_t now)
++{
++	ktime_t delta = ktime_sub(now, ws->start_prevent_time);
++	ws->prevent_sleep_time = ktime_add(ws->prevent_sleep_time, delta);
++}
++#else
++static inline void update_prevent_sleep_time(struct wakeup_source *ws,
++					     ktime_t now) {}
++#endif
++
+ /**
+  * wakup_source_deactivate - Mark given wakeup source as inactive.
+  * @ws: Wakeup source to handle.
+@@ -442,6 +477,7 @@ EXPORT_SYMBOL_GPL(pm_stay_awake);
+  */
+ static void wakeup_source_deactivate(struct wakeup_source *ws)
+ {
++	unsigned int cnt, inpr, cec;
+ 	ktime_t duration;
+ 	ktime_t now;
+ 
+@@ -468,14 +504,23 @@ static void wakeup_source_deactivate(struct wakeup_source *ws)
+ 	if (ktime_to_ns(duration) > ktime_to_ns(ws->max_time))
+ 		ws->max_time = duration;
+ 
++	ws->last_time = now;
+ 	del_timer(&ws->timer);
+ 	ws->timer_expires = 0;
+ 
++	if (ws->autosleep_enabled)
++		update_prevent_sleep_time(ws, now);
++
+ 	/*
+ 	 * Increment the counter of registered wakeup events and decrement the
+ 	 * couter of wakeup events in progress simultaneously.
+ 	 */
+-	atomic_add(MAX_IN_PROGRESS, &combined_event_count);
++	cec = atomic_add_return(MAX_IN_PROGRESS, &combined_event_count);
++	trace_wakeup_source_deactivate(ws->name, cec);
++
++	split_counters(&cnt, &inpr);
++	if (!inpr && waitqueue_active(&wakeup_count_wait_queue))
++		wake_up(&wakeup_count_wait_queue);
+ }
+ 
+ /**
+@@ -536,8 +581,10 @@ static void pm_wakeup_timer_fn(unsigned long data)
+ 	spin_lock_irqsave(&ws->lock, flags);
+ 
+ 	if (ws->active && ws->timer_expires
+-	    && time_after_eq(jiffies, ws->timer_expires))
++	    && time_after_eq(jiffies, ws->timer_expires)) {
+ 		wakeup_source_deactivate(ws);
++		ws->expire_count++;
++	}
+ 
+ 	spin_unlock_irqrestore(&ws->lock, flags);
+ }
+@@ -564,9 +611,7 @@ void __pm_wakeup_event(struct wakeup_source *ws, unsigned int msec)
+ 
+ 	spin_lock_irqsave(&ws->lock, flags);
+ 
+-	ws->event_count++;
+-	if (!ws->active)
+-		wakeup_source_activate(ws);
++	wakeup_source_report_event(ws);
+ 
+ 	if (!msec) {
+ 		wakeup_source_deactivate(ws);
+@@ -608,21 +653,28 @@ void pm_wakeup_event(struct device *dev, unsigned int msec)
+ }
+ EXPORT_SYMBOL_GPL(pm_wakeup_event);
+ 
+-/**
+- * pm_wakeup_update_hit_counts - Update hit counts of all active wakeup sources.
+- */
+-static void pm_wakeup_update_hit_counts(void)
++static void print_active_wakeup_sources(void)
+ {
+-	unsigned long flags;
+ 	struct wakeup_source *ws;
++	int active = 0;
++	struct wakeup_source *last_activity_ws = NULL;
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+-		spin_lock_irqsave(&ws->lock, flags);
+-		if (ws->active)
+-			ws->hit_count++;
+-		spin_unlock_irqrestore(&ws->lock, flags);
++		if (ws->active) {
++			pr_info("active wakeup source: %s\n", ws->name);
++			active = 1;
++		} else if (!active &&
++			   (!last_activity_ws ||
++			    ktime_to_ns(ws->last_time) >
++			    ktime_to_ns(last_activity_ws->last_time))) {
++			last_activity_ws = ws;
++		}
+ 	}
++
++	if (!active && last_activity_ws)
++		pr_info("last active wakeup source: %s\n",
++			last_activity_ws->name);
+ 	rcu_read_unlock();
+ }
+ 
+@@ -648,32 +700,42 @@ bool pm_wakeup_pending(void)
+ 		events_check_enabled = !ret;
+ 	}
+ 	spin_unlock_irqrestore(&events_lock, flags);
++
+ 	if (ret)
+-		pm_wakeup_update_hit_counts();
++		print_active_wakeup_sources();
++
+ 	return ret;
+ }
+ 
+ /**
+  * pm_get_wakeup_count - Read the number of registered wakeup events.
+  * @count: Address to store the value at.
++ * @block: Whether or not to block.
+  *
+- * Store the number of registered wakeup events at the address in @count.  Block
+- * if the current number of wakeup events being processed is nonzero.
++ * Store the number of registered wakeup events at the address in @count.  If
++ * @block is set, block until the current number of wakeup events being
++ * processed is zero.
+  *
+- * Return 'false' if the wait for the number of wakeup events being processed to
+- * drop down to zero has been interrupted by a signal (and the current number
+- * of wakeup events being processed is still nonzero).  Otherwise return 'true'.
++ * Return 'false' if the current number of wakeup events being processed is
++ * nonzero.  Otherwise return 'true'.
+  */
+-bool pm_get_wakeup_count(unsigned int *count)
++bool pm_get_wakeup_count(unsigned int *count, bool block)
+ {
+ 	unsigned int cnt, inpr;
+ 
+-	for (;;) {
+-		split_counters(&cnt, &inpr);
+-		if (inpr == 0 || signal_pending(current))
+-			break;
+-		pm_wakeup_update_hit_counts();
+-		schedule_timeout_interruptible(msecs_to_jiffies(TIMEOUT));
++	if (block) {
++		DEFINE_WAIT(wait);
++
++		for (;;) {
++			prepare_to_wait(&wakeup_count_wait_queue, &wait,
++					TASK_INTERRUPTIBLE);
++			split_counters(&cnt, &inpr);
++			if (inpr == 0 || signal_pending(current))
++				break;
++
++			schedule();
++		}
++		finish_wait(&wakeup_count_wait_queue, &wait);
+ 	}
+ 
+ 	split_counters(&cnt, &inpr);
+@@ -694,20 +756,47 @@ bool pm_get_wakeup_count(unsigned int *count)
+ bool pm_save_wakeup_count(unsigned int count)
+ {
+ 	unsigned int cnt, inpr;
++	unsigned long flags;
+ 
+ 	events_check_enabled = false;
+-	spin_lock_irq(&events_lock);
++	spin_lock_irqsave(&events_lock, flags);
+ 	split_counters(&cnt, &inpr);
+ 	if (cnt == count && inpr == 0) {
+ 		saved_count = count;
+ 		events_check_enabled = true;
+ 	}
+-	spin_unlock_irq(&events_lock);
+-	if (!events_check_enabled)
+-		pm_wakeup_update_hit_counts();
++	spin_unlock_irqrestore(&events_lock, flags);
+ 	return events_check_enabled;
+ }
+ 
++#ifdef CONFIG_PM_AUTOSLEEP
++/**
++ * pm_wakep_autosleep_enabled - Modify autosleep_enabled for all wakeup sources.
++ * @enabled: Whether to set or to clear the autosleep_enabled flags.
++ */
++void pm_wakep_autosleep_enabled(bool set)
++{
++	struct wakeup_source *ws;
++	ktime_t now = ktime_get();
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
++		spin_lock_irq(&ws->lock);
++		if (ws->autosleep_enabled != set) {
++			ws->autosleep_enabled = set;
++			if (ws->active) {
++				if (set)
++					ws->start_prevent_time = now;
++				else
++					update_prevent_sleep_time(ws, now);
++			}
++		}
++		spin_unlock_irq(&ws->lock);
++	}
++	rcu_read_unlock();
++}
++#endif /* CONFIG_PM_AUTOSLEEP */
++
+ static struct dentry *wakeup_sources_stats_dentry;
+ 
+ /**
+@@ -723,27 +812,37 @@ static int print_wakeup_source_stats(struct seq_file *m,
+ 	ktime_t max_time;
+ 	unsigned long active_count;
+ 	ktime_t active_time;
++	ktime_t prevent_sleep_time;
+ 	int ret;
+ 
+ 	spin_lock_irqsave(&ws->lock, flags);
+ 
+ 	total_time = ws->total_time;
+ 	max_time = ws->max_time;
++	prevent_sleep_time = ws->prevent_sleep_time;
+ 	active_count = ws->active_count;
+ 	if (ws->active) {
+-		active_time = ktime_sub(ktime_get(), ws->last_time);
++		ktime_t now = ktime_get();
++
++		active_time = ktime_sub(now, ws->last_time);
+ 		total_time = ktime_add(total_time, active_time);
+ 		if (active_time.tv64 > max_time.tv64)
+ 			max_time = active_time;
++
++		if (ws->autosleep_enabled)
++			prevent_sleep_time = ktime_add(prevent_sleep_time,
++				ktime_sub(now, ws->start_prevent_time));
+ 	} else {
+ 		active_time = ktime_set(0, 0);
+ 	}
+ 
+-	ret = seq_printf(m, "%-12s\t%lu\t\t%lu\t\t%lu\t\t"
+-			"%lld\t\t%lld\t\t%lld\t\t%lld\n",
+-			ws->name, active_count, ws->event_count, ws->hit_count,
++	ret = seq_printf(m, "%-12s\t%lu\t\t%lu\t\t%lu\t\t%lu\t\t"
++			"%lld\t\t%lld\t\t%lld\t\t%lld\t\t%lld\n",
++			ws->name, active_count, ws->event_count,
++			ws->wakeup_count, ws->expire_count,
+ 			ktime_to_ms(active_time), ktime_to_ms(total_time),
+-			ktime_to_ms(max_time), ktime_to_ms(ws->last_time));
++			ktime_to_ms(max_time), ktime_to_ms(ws->last_time),
++			ktime_to_ms(prevent_sleep_time));
+ 
+ 	spin_unlock_irqrestore(&ws->lock, flags);
+ 
+@@ -758,8 +857,9 @@ static int wakeup_sources_stats_show(struct seq_file *m, void *unused)
+ {
+ 	struct wakeup_source *ws;
+ 
+-	seq_puts(m, "name\t\tactive_count\tevent_count\thit_count\t"
+-		"active_since\ttotal_time\tmax_time\tlast_change\n");
++	seq_puts(m, "name\t\tactive_count\tevent_count\twakeup_count\t"
++		"expire_count\tactive_since\ttotal_time\tmax_time\t"
++		"last_change\tprevent_suspend_time\n");
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(ws, &wakeup_sources, entry)

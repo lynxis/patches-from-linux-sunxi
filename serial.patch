@@ -1,0 +1,522 @@
+diff --git a/drivers/tty/serial/8250/8250.c b/drivers/tty/serial/8250/8250.c
+index d537431..894aeee 100644
+--- a/drivers/tty/serial/8250/8250.c
++++ b/drivers/tty/serial/8250/8250.c
+@@ -263,8 +263,9 @@ static const struct serial8250_config uart_config[] = {
+ 	[PORT_U6_16550A] = {
+ 		.name		= "U6_16550A",
+ 		.fifo_size	= 64,
+-		.tx_loadsz	= 64,
+-		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_10,
++		.tx_loadsz	= 32,
++		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_11
++		              | UART_FCR_T_TRIG_10,
+ 		.flags		= UART_CAP_FIFO | UART_CAP_AFE,
+ 	},
+ 	[PORT_TEGRA] = {
+@@ -843,7 +844,7 @@ static int broken_efr(struct uart_8250_port *up)
+ 	/*
+ 	 * Exar ST16C2550 "A2" devices incorrectly detect as
+ 	 * having an EFR, and report an ID of 0x0201.  See
+-	 * http://linux.derkeiler.com/Mailing-Lists/Kernel/2004-11/4812.html 
++	 * http://linux.derkeiler.com/Mailing-Lists/Kernel/2004-11/4812.html
+ 	 */
+ 	if (autoconfig_read_divisor_id(up) == 0x0201 && size_fifo(up) == 16)
+ 		return 1;
+@@ -1486,6 +1487,7 @@ unsigned int serial8250_modem_status(struct uart_8250_port *up)
+ {
+ 	struct uart_port *port = &up->port;
+ 	unsigned int status = serial_in(up, UART_MSR);
++	unsigned int mcr = serial_in(up, UART_MCR);
+ 
+ 	status |= up->msr_saved_flags;
+ 	up->msr_saved_flags = 0;
+@@ -1497,9 +1499,14 @@ unsigned int serial8250_modem_status(struct uart_8250_port *up)
+ 			port->icount.dsr++;
+ 		if (status & UART_MSR_DDCD)
+ 			uart_handle_dcd_change(port, status & UART_MSR_DCD);
+-		if (status & UART_MSR_DCTS)
++		/*
++		 * modified by yemao, 2011-12-1 13:28:32
++		 * Do not check the changement of CTS signal if Auto Flow Control is enabled
++		 * so you  must check this enable bit in MCR register
++		 */
++		if (!(mcr & UART_MCR_AFE) && (status & UART_MSR_DCTS)) {
+ 			uart_handle_cts_change(port, status & UART_MSR_CTS);
+-
++		}
+ 		wake_up_interruptible(&port->state->port.delta_msr_wait);
+ 	}
+ 
+@@ -1579,8 +1586,9 @@ static irqreturn_t serial8250_interrupt(int irq, void *dev_id)
+ 		if (port->handle_irq(port)) {
+ 			handled = 1;
+ 			end = NULL;
+-		} else if (end == NULL)
++		} else if (end == NULL) {
+ 			end = l;
++		}
+ 
+ 		l = l->next;
+ 
+@@ -1817,7 +1825,6 @@ static void serial8250_set_mctrl(struct uart_port *port, unsigned int mctrl)
+ 		mcr |= UART_MCR_LOOP;
+ 
+ 	mcr = (mcr & up->mcr_mask) | up->mcr_force | up->mcr;
+-
+ 	serial_port_out(port, UART_MCR, mcr);
+ }
+ 
+diff --git a/drivers/tty/serial/8250/8250.h b/drivers/tty/serial/8250/8250.h
+index 2868a1d..5d23bd1 100644
+--- a/drivers/tty/serial/8250/8250.h
++++ b/drivers/tty/serial/8250/8250.h
+@@ -75,6 +75,8 @@ struct serial8250_config {
+ #define UART_BUG_NOMSR	(1 << 2)	/* UART has buggy MSR status bits (Au1x00) */
+ #define UART_BUG_THRE	(1 << 3)	/* UART has buggy THRE reassertion */
+ 
++#define UART_USR        31
++
+ #define PROBE_RSA	(1 << 0)
+ #define PROBE_ANY	(~0)
+ 
+diff --git a/drivers/tty/serial/8250/8250_sunxi.c b/drivers/tty/serial/8250/8250_sunxi.c
+new file mode 100644
+index 0000000..7ebf536
+--- /dev/null
++++ b/drivers/tty/serial/8250/8250_sunxi.c
+@@ -0,0 +1,373 @@
++/*
++ *  8250_sunxi.c
++ *
++ *  Copyright (C) 1996-2003 Russell King.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * HdG: The sunxi uarts seem to be similar to the Synopsys DesignWare 8250
++ * uarts, they also have a busy-detect interrupt signalled by a value of 7
++ * in the IIR register. The code for handling this is copied from 8250_dw.c :
++ *
++ * Synopsys DesignWare 8250 driver.
++ *
++ * Copyright 2011 Picochip, Jamie Iles.
++ *
++ * The Synopsys DesignWare 8250 has an extra feature whereby it detects if the
++ * LCR is written whilst busy.  If it is, then a busy detect interrupt is
++ * raised, the LCR needs to be rewritten and the uart status register read.
++ */
++#define pr_fmt(fmt)	"[uart]: " fmt
++
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/tty.h>
++#include <linux/serial_core.h>
++#include <linux/serial_reg.h>
++#include <linux/errno.h>
++#include <linux/ioport.h>
++#include <linux/slab.h>
++#include <linux/device.h>
++#include <linux/init.h>
++
++#include <asm/io.h>
++#include <asm/ecard.h>
++#include <asm/string.h>
++#include <linux/clk.h>
++
++#include <plat/system.h>
++#include <plat/sys_config.h>
++#include <mach/platform.h>
++#include <mach/irqs.h>
++
++#include "8250.h"
++
++/* Register base define */
++#define UART_BASE       (0x01C28000)
++#define UART_BASE_OS    (0x400)
++#define UARTx_BASE(x)   (UART_BASE + (x) * UART_BASE_OS)
++#define RESSIZE(res)    (((res)->end - (res)->start)+1)
++
++struct sw_serial_port {
++	int port_no;
++	int line;
++	int last_lcr;
++	u32 pio_hdle;
++	struct clk *clk;
++	u32 sclk;
++	struct resource *mmres;
++	u32 irq;
++	struct platform_device *pdev;
++};
++
++static int sw_serial_get_resource(struct sw_serial_port *sport)
++{
++	char name[16];
++	struct clk *pclk = NULL;
++	char uart_para[16];
++	int ret;
++
++	/* get register base */
++	sport->mmres = platform_get_resource(sport->pdev, IORESOURCE_MEM, 0);
++	if (!sport->mmres) {
++		ret = -ENODEV;
++		goto err_out;
++	}
++
++	/* get clock */
++	pclk = clk_get(&sport->pdev->dev, "apb1");
++	if (IS_ERR(pclk)) {
++		ret = PTR_ERR(pclk);
++		goto iounmap;
++	}
++	sport->sclk = clk_get_rate(pclk);
++	clk_put(pclk);
++
++	sprintf(name, "apb_uart%d", sport->port_no);
++	sport->clk = clk_get(&sport->pdev->dev, name);
++	if (IS_ERR(sport->clk)) {
++		ret = PTR_ERR(sport->clk);
++		goto iounmap;
++	}
++	clk_enable(sport->clk);
++
++	/* get irq */
++	sport->irq = platform_get_irq(sport->pdev, 0);
++	if (sport->irq == 0) {
++		ret = -EINVAL;
++		goto free_pclk;
++	}
++
++	/* get gpio resource */
++	sprintf(uart_para, "uart_para%d", sport->port_no);
++	sport->pio_hdle = gpio_request_ex(uart_para, NULL);
++	if (!sport->pio_hdle) {
++		ret = -EINVAL;
++		goto free_pclk;
++	}
++	return 0;
++
++ free_pclk:
++	clk_put(sport->clk);
++ iounmap:
++ err_out:
++	return ret;
++}
++
++static int sw_serial_put_resource(struct sw_serial_port *sport)
++{
++	clk_disable(sport->clk);
++	clk_put(sport->clk);
++	gpio_release(sport->pio_hdle, 1);
++	return 0;
++}
++
++static void dw8250_serial_out32(struct uart_port *p, int offset, int value)
++{
++	struct sw_serial_port *d = p->private_data;
++
++	if (offset == UART_LCR)
++		d->last_lcr = value;
++
++	offset <<= p->regshift;
++	writel(value, p->membase + offset);
++}
++
++static unsigned int dw8250_serial_in32(struct uart_port *p, int offset)
++{
++	offset <<= p->regshift;
++
++	return readl(p->membase + offset);
++}
++
++static int dw8250_handle_irq(struct uart_port *p)
++{
++	struct sw_serial_port *d = p->private_data;
++	unsigned int iir = p->serial_in(p, UART_IIR);
++
++	if (serial8250_handle_irq(p, iir)) {
++		return 1;
++	} else if ((iir & UART_IIR_BUSY) == UART_IIR_BUSY) {
++		/* Clear the USR and write the LCR again. */
++		(void)p->serial_in(p, UART_USR);
++		p->serial_out(p, d->last_lcr, UART_LCR);
++
++		return 1;
++	}
++
++	return 0;
++}
++
++static void sw_serial_pm(struct uart_port *port, unsigned int state,
++			 unsigned int oldstate)
++{
++	struct sw_serial_port *up = port->private_data;
++
++	if (!state)
++		clk_enable(up->clk);
++	else
++		clk_disable(up->clk);
++}
++
++static int __devinit sw_serial_probe(struct platform_device *dev)
++{
++	struct sw_serial_port *sport;
++	struct uart_port port = {};
++	int ret;
++
++	sport = kzalloc(sizeof(struct sw_serial_port), GFP_KERNEL);
++	if (!sport)
++		return -ENOMEM;
++	sport->port_no = dev->id;
++	sport->pdev = dev;
++
++	ret = sw_serial_get_resource(sport);
++	if (ret) {
++		printk(KERN_ERR "Failed to get resource\n");
++		goto free_dev;
++	}
++
++	port.private_data = sport;
++	port.irq = sport->irq;
++	port.mapbase = sport->mmres->start;
++	port.fifosize = 64;
++	port.regshift = 2;
++	port.iotype  = UPIO_MEM32;
++	port.flags = UPF_IOREMAP | UPF_BOOT_AUTOCONF;
++	port.uartclk = sport->sclk;
++	port.pm = sw_serial_pm;
++	port.dev = &dev->dev;
++	port.serial_in = dw8250_serial_in32;
++	port.serial_out = dw8250_serial_out32;
++	port.handle_irq = dw8250_handle_irq;
++
++	pr_info("serial probe %d irq %d mapbase 0x%08x\n", dev->id,
++		sport->irq, sport->mmres->start);
++	ret = serial8250_register_port(&port);
++	if (ret < 0)
++		goto free_dev;
++
++	sport->line = ret;
++	platform_set_drvdata(dev, sport);
++	return 0;
++
++ free_dev:
++	kfree(sport);
++	sport = NULL;
++	return ret;
++}
++
++static int __devexit sw_serial_remove(struct platform_device *dev)
++{
++	struct sw_serial_port *sport = platform_get_drvdata(dev);
++
++	pr_info("serial remove\n");
++	serial8250_unregister_port(sport->line);
++	sw_serial_put_resource(sport);
++
++	platform_set_drvdata(dev, NULL);
++	kfree(sport);
++	sport = NULL;
++	return 0;
++}
++
++static struct platform_driver sw_serial_driver = {
++	.probe = sw_serial_probe,
++	.remove = sw_serial_remove,
++	.driver = {
++		   .name = "sunxi-uart",
++		   .owner = THIS_MODULE,
++		   },
++};
++
++#define RES(MEM_BASE, IRQ)	{ \
++	{.start = MEM_BASE, .end = MEM_BASE + UART_BASE_OS - 1, .flags = IORESOURCE_MEM}, \
++	{.start = IRQ, .end = IRQ, .flags = IORESOURCE_IRQ}, \
++}
++static struct resource sw_uart_res[8][2] = {
++	RES(UARTx_BASE(0), SW_INT_IRQNO_UART0),
++	RES(UARTx_BASE(1), SW_INT_IRQNO_UART1),
++	RES(UARTx_BASE(2), SW_INT_IRQNO_UART2),
++	RES(UARTx_BASE(3), SW_INT_IRQNO_UART3),
++	RES(UARTx_BASE(4), SW_INT_IRQNO_UART4),
++	RES(UARTx_BASE(5), SW_INT_IRQNO_UART5),
++	RES(UARTx_BASE(6), SW_INT_IRQNO_UART6),
++	RES(UARTx_BASE(7), SW_INT_IRQNO_UART7),
++};
++#undef RES
++
++void
++sw_serial_device_release(struct device *dev)
++{
++	/* FILL ME! */
++}
++
++static struct platform_device sw_uart_dev[] = {
++	[0] = {.name = "sunxi-uart", .id = 0,
++			.num_resources = ARRAY_SIZE(sw_uart_res[0]),
++			.resource = &sw_uart_res[0][0], .dev = {
++					.release = &sw_serial_device_release
++			}
++	},
++	[1] = {.name = "sunxi-uart", .id = 1,
++			.num_resources = ARRAY_SIZE(sw_uart_res[1]),
++			.resource = &sw_uart_res[1][0], .dev = {
++					.release = &sw_serial_device_release
++			}
++	},
++	[2] = {.name = "sunxi-uart", .id = 2,
++			.num_resources = ARRAY_SIZE(sw_uart_res[2]),
++			.resource = &sw_uart_res[2][0], .dev = {
++					.release = &sw_serial_device_release
++			}
++	},
++	[3] = {.name = "sunxi-uart", .id = 3,
++			.num_resources = ARRAY_SIZE(sw_uart_res[3]),
++			.resource = &sw_uart_res[3][0], .dev = {
++			.release = &sw_serial_device_release
++			}
++	},
++	[4] = {.name = "sunxi-uart", .id = 4,
++			.num_resources = ARRAY_SIZE(sw_uart_res[4]),
++			.resource = &sw_uart_res[4][0], .dev = {
++					.release = &sw_serial_device_release
++			}
++	},
++	[5] = {.name = "sunxi-uart", .id = 5,
++			.num_resources = ARRAY_SIZE(sw_uart_res[5]),
++			.resource = &sw_uart_res[5][0], .dev = {
++					.release = &sw_serial_device_release
++			}
++	},
++	[6] = {.name = "sunxi-uart", .id = 6,
++			.num_resources = ARRAY_SIZE(sw_uart_res[6]),
++			.resource = &sw_uart_res[6][0], .dev = {
++					.release = &sw_serial_device_release
++			}
++	},
++	[7] = {.name = "sunxi-uart", .id = 7,
++			.num_resources = ARRAY_SIZE(sw_uart_res[7]),
++			.resource = &sw_uart_res[7][0], .dev = {
++					.release = &sw_serial_device_release
++			}
++	},
++};
++
++static int sw_serial_get_max_ports(void)
++{
++	return sunxi_is_sun5i() ? 4 : 8;
++}
++
++static unsigned uart_used;
++static int __init sw_serial_init(void)
++{
++	int ret;
++	int i, max = sw_serial_get_max_ports();
++	int used = 0;
++	char uart_para[16];
++
++	uart_used = 0;
++	for (i = 0; i < max; i++, used = 0) {
++		if (sunxi_is_a13() && i == 2) /* No uart2 on a13 */
++			continue;
++		sprintf(uart_para, "uart_para%d", i);
++		ret = script_parser_fetch(uart_para, "uart_used", &used, sizeof(int));
++		if (ret)
++			pr_err("failed to get uart%d's used information\n", i);
++		pr_debug("uart:%d used:%d\n", i, used);
++		if (used) {
++			uart_used |= 1 << i;
++			platform_device_register(&sw_uart_dev[i]);
++		}
++	}
++
++	if (uart_used) {
++		pr_info("used uart info.: 0x%02x\n", uart_used);
++		ret = platform_driver_register(&sw_serial_driver);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void __exit sw_serial_exit(void)
++{
++	int i, max = sw_serial_get_max_ports();
++
++	if (uart_used)
++		platform_driver_unregister(&sw_serial_driver);
++
++	for (i = 0; i < max; i++) {
++		if (uart_used & (1 << i))
++			platform_device_unregister(&sw_uart_dev[i]);
++	}
++}
++
++MODULE_AUTHOR("Aaron.myeh<leafy.myeh@allwinnertech.com>");
++MODULE_DESCRIPTION("SUNXI 8250-compatible serial port expansion card driver");
++MODULE_LICENSE("GPL");
++
++module_init(sw_serial_init);
++module_exit(sw_serial_exit);
+diff --git a/drivers/tty/serial/8250/Kconfig b/drivers/tty/serial/8250/Kconfig
+index 591f801..f1c388c 100644
+--- a/drivers/tty/serial/8250/Kconfig
++++ b/drivers/tty/serial/8250/Kconfig
+@@ -76,6 +76,11 @@ config SERIAL_8250_GSC
+ 	depends on SERIAL_8250 && GSC
+ 	default SERIAL_8250
+ 
++config SERIAL_8250_SUNXI
++	tristate
++	depends on SERIAL_8250 && (ARCH_SUN4I || ARCH_SUN5I || ARCH_SUN7I)
++	default SERIAL_8250
++
+ config SERIAL_8250_PCI
+ 	tristate "8250/16550 PCI device support" if EXPERT
+ 	depends on SERIAL_8250 && PCI
+diff --git a/drivers/tty/serial/8250/Makefile b/drivers/tty/serial/8250/Makefile
+index 867bba7..b939e87 100644
+--- a/drivers/tty/serial/8250/Makefile
++++ b/drivers/tty/serial/8250/Makefile
+@@ -18,3 +18,4 @@ obj-$(CONFIG_SERIAL_8250_HUB6)		+= 8250_hub6.o
+ obj-$(CONFIG_SERIAL_8250_MCA)		+= 8250_mca.o
+ obj-$(CONFIG_SERIAL_8250_FSL)		+= 8250_fsl.o
+ obj-$(CONFIG_SERIAL_8250_DW)		+= 8250_dw.o
++obj-$(CONFIG_SERIAL_8250_SUNXI)		+= 8250_sunxi.o
+diff --git a/drivers/tty/serial/samsung.c b/drivers/tty/serial/samsung.c
+index d8b0aee..c49f3bf 100644
+--- a/drivers/tty/serial/samsung.c
++++ b/drivers/tty/serial/samsung.c
+@@ -427,6 +427,8 @@ static void s3c24xx_serial_shutdown(struct uart_port *port)
+ 	if (ourport->tx_claimed) {
+ 		if (!s3c24xx_serial_has_interrupt_mask(port))
+ 			free_irq(ourport->tx_irq, ourport);
++		else
++			free_irq(port->irq, ourport);
+ 		tx_enabled(port) = 0;
+ 		ourport->tx_claimed = 0;
+ 	}
+@@ -434,6 +436,8 @@ static void s3c24xx_serial_shutdown(struct uart_port *port)
+ 	if (ourport->rx_claimed) {
+ 		if (!s3c24xx_serial_has_interrupt_mask(port))
+ 			free_irq(ourport->rx_irq, ourport);
++		/* else already freed above as the s3c64xx_serial_startup()
++		 * will have set both tx_claimed and rx_claimed */
+ 		ourport->rx_claimed = 0;
+ 		rx_enabled(port) = 0;
+ 	}
+diff --git a/drivers/tty/serial/serial_core.c b/drivers/tty/serial/serial_core.c
+index 246b823..a4895dc 100644
+--- a/drivers/tty/serial/serial_core.c
++++ b/drivers/tty/serial/serial_core.c
+@@ -94,6 +94,9 @@ static void __uart_start(struct tty_struct *tty)
+ 	struct uart_state *state = tty->driver_data;
+ 	struct uart_port *port = state->uart_port;
+ 
++	if (port->ops->wake_peer)
++		port->ops->wake_peer(port);
++
+ 	if (!uart_circ_empty(&state->xmit) && state->xmit.buf &&
+ 	    !tty->stopped && !tty->hw_stopped)
+ 		port->ops->start_tx(port);
