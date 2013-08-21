@@ -1,0 +1,327 @@
+diff --git a/block/genhd.c b/block/genhd.c
+index 60108d9..2ade756 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1110,6 +1110,22 @@ static void disk_release(struct device *dev)
+ 		blk_put_queue(disk->queue);
+ 	kfree(disk);
+ }
++
++static int disk_uevent(struct device *dev, struct kobj_uevent_env *env)
++{
++	struct gendisk *disk = dev_to_disk(dev);
++	struct disk_part_iter piter;
++	struct hd_struct *part;
++	int cnt = 0;
++
++	disk_part_iter_init(&piter, disk, 0);
++	while((part = disk_part_iter_next(&piter)))
++		cnt++;
++	disk_part_iter_exit(&piter);
++	add_uevent_var(env, "NPARTS=%u", cnt);
++	return 0;
++}
++
+ struct class block_class = {
+ 	.name		= "block",
+ };
+@@ -1128,6 +1144,7 @@ static struct device_type disk_type = {
+ 	.groups		= disk_attr_groups,
+ 	.release	= disk_release,
+ 	.devnode	= block_devnode,
++	.uevent		= disk_uevent,
+ };
+ 
+ #ifdef CONFIG_PROC_FS
+diff --git a/block/partition-generic.c b/block/partition-generic.c
+index 7b8b8d1..8d9281d 100644
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@ -38,6 +38,11 @@ char *disk_name(struct gendisk *hd, int partno, char *buf)
+ 	else if (isdigit(hd->disk_name[strlen(hd->disk_name)-1]))
+ 		snprintf(buf, BDEVNAME_SIZE, "%sp%d", hd->disk_name, partno);
+ 	else
++#ifdef CONFIG_SUNXI_NAND_COMPAT_DEV /* nanda - nandz compat names */
++	if (!strcmp(hd->disk_name, "nand") && (partno <= 'z' - 'a' + 1))
++		snprintf(buf, BDEVNAME_SIZE, "%s%c", hd->disk_name, 'a' - 1 + partno);
++	else
++#endif
+ 		snprintf(buf, BDEVNAME_SIZE, "%s%d", hd->disk_name, partno);
+ 
+ 	return buf;
+@@ -216,10 +221,21 @@ static void part_release(struct device *dev)
+ 	kfree(p);
+ }
+ 
++static int part_uevent(struct device *dev, struct kobj_uevent_env *env)
++{
++	struct hd_struct *part = dev_to_part(dev);
++
++	add_uevent_var(env, "PARTN=%u", part->partno);
++	if (part->info && part->info->volname[0])
++		add_uevent_var(env, "PARTNAME=%s", part->info->volname);
++	return 0;
++}
++
+ struct device_type part_type = {
+ 	.name		= "partition",
+ 	.groups		= part_attr_groups,
+ 	.release	= part_release,
++	.uevent		= part_uevent,
+ };
+ 
+ static void delete_partition_rcu_cb(struct rcu_head *head)
+@@ -314,6 +330,11 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
+ 	}
+ 
+ 	dname = dev_name(ddev);
++#ifdef CONFIG_SUNXI_NAND_COMPAT_DEV
++	if (!strcmp(dname, "nand"))
++		dev_set_name(pdev, "%s%c", dname, 'a' - 1 + partno);
++	else
++#endif
+ 	if (isdigit(dname[strlen(dname) - 1]))
+ 		dev_set_name(pdev, "%sp%d", dname, partno);
+ 	else
+diff --git a/block/partitions/Kconfig b/block/partitions/Kconfig
+index cb5f0a3..0cd4d03 100644
+--- a/block/partitions/Kconfig
++++ b/block/partitions/Kconfig
+@@ -249,3 +249,14 @@ config SYSV68_PARTITION
+ 	  partition table format used by Motorola Delta machines (using
+ 	  sysv68).
+ 	  Otherwise, say N.
++
++config SUNXI_NAND_PARTITION
++	bool "sunxi nand partition table support" if PARTITION_ADVANCED
++	default y if VME
++	select CRC32
++	---help---
++	  This partition scheme is used on Allwinner sunxi nand chips connected
++	  directly to SoC.
++
++	  If unsure say N.
++
+diff --git a/block/partitions/Makefile b/block/partitions/Makefile
+index 03af8ea..288b443 100644
+--- a/block/partitions/Makefile
++++ b/block/partitions/Makefile
+@@ -18,3 +18,5 @@ obj-$(CONFIG_IBM_PARTITION) += ibm.o
+ obj-$(CONFIG_EFI_PARTITION) += efi.o
+ obj-$(CONFIG_KARMA_PARTITION) += karma.o
+ obj-$(CONFIG_SYSV68_PARTITION) += sysv68.o
++obj-$(CONFIG_SUNXI_NAND_PARTITION) += sunxi_nand311.o
++obj-$(CONFIG_SUNXI_NAND_PARTITION) += sunxi_nand411.o
+diff --git a/block/partitions/check.c b/block/partitions/check.c
+index bc90867..e54d9da 100644
+--- a/block/partitions/check.c
++++ b/block/partitions/check.c
+@@ -33,6 +33,7 @@
+ #include "efi.h"
+ #include "karma.h"
+ #include "sysv68.h"
++#include "sunxi_nand.h"
+ 
+ int warn_no_part = 1; /*This is ugly: should make genhd removable media aware*/
+ 
+@@ -103,6 +104,10 @@ static int (*check_part[])(struct parsed_partitions *) = {
+ #ifdef CONFIG_SYSV68_PARTITION
+ 	sysv68_partition,
+ #endif
++#ifdef CONFIG_SUNXI_NAND_PARTITION
++	sunxi_nand311_partition,
++	sunxi_nand411_partition,
++#endif
+ 	NULL
+ };
+ 
+diff --git a/block/partitions/check.h b/block/partitions/check.h
+index 52b1003..059e5db 100644
+--- a/block/partitions/check.h
++++ b/block/partitions/check.h
+@@ -43,6 +43,11 @@ put_partition(struct parsed_partitions *p, int n, sector_t from, sector_t size)
+ 
+ 		p->parts[n].from = from;
+ 		p->parts[n].size = size;
++#ifdef CONFIG_SUNXI_NAND_COMPAT_DEV
++		if (!strcmp(p->name, "nand"))
++			snprintf(tmp, sizeof(tmp), " %s%c", p->name, 'a' - 1 + n);
++		else
++#endif
+ 		snprintf(tmp, sizeof(tmp), " %s%d", p->name, n);
+ 		strlcat(p->pp_buf, tmp, PAGE_SIZE);
+ 	}
+diff --git a/block/partitions/sunxi_nand.c b/block/partitions/sunxi_nand.c
+new file mode 100644
+index 0000000..1c90ce2
+--- /dev/null
++++ b/block/partitions/sunxi_nand.c
+@@ -0,0 +1,138 @@
++/*
++ *  fs/partitions/sunxi_nand.c
++ *  Code extracted from drivers/block/genhd.c
++ */
++
++#include "check.h"
++#include <linux/crc32.h>
++
++#define sector_size 512
++#define mbr_sector  ((no-1) * MBR_SIZE / sector_size)
++#define CRC_MAGIC 0xffffffff
++
++/* no indexes from 1 - 0 is invalid */
++static int sunxi_nand_validate_mbr(struct parsed_partitions *state, int no)
++{
++	__u32 iv = CRC_MAGIC;
++	__u32 crc;
++	__u32 calculated;
++	__u32 sector = mbr_sector;
++	Sector sect;
++	struct MBR *mbr = 0;
++	char b[BDEVNAME_SIZE];
++
++	bdevname(state->bdev, b);
++
++	mbr = read_part_sector(state, sector, &sect);
++	if (!mbr) {
++		printk(KERN_ERR "Dev Sunxi %s %s header: error reading sector %d\n",
++				MBR_MAGIC, b, sector);
++		goto error;
++	}
++
++	if (strncmp(MBR_MAGIC, mbr->tag.magic, 8)) {
++		printk(KERN_WARNING "Dev Sunxi %s %s magic does not match for MBR %d: %8.8s\n",
++				MBR_MAGIC, b, no, mbr->tag.magic);
++		goto error;
++	}
++	if (MBR_VERSION != mbr->tag.version) {
++		printk(KERN_WARNING "Dev Sunxi %s %s version does not match for MBR %d: 0x%x != 0x%x\n",
++				MBR_MAGIC, b, no, mbr->tag.version,
++				MBR_VERSION);
++		goto error;
++	}
++	if (no - 1 != mbr->tag.index) {
++		printk(KERN_WARNING "Dev Sunxi %s %s mbr number does not match for MBR %d: %d\n",
++				MBR_MAGIC, b, no, mbr->tag.index);
++	}
++	/* actual MBR sizes are either << PAGE_SIZE (all four copies in one
++	 * page) or multiple of page size so this should work regardless of
++	 * internal details of undocumented read_part_sector */
++	calculated = min(MBR_SIZE, PAGE_SIZE);
++	crc = *(__u32 *)mbr;
++	iv = (crc32_le(iv, (__u8 *)mbr + 4, calculated - 4));
++	while (calculated < MBR_SIZE) {
++		int chunk = min(PAGE_SIZE, MBR_SIZE - calculated);
++		put_dev_sector(sect);
++		sector += PAGE_SIZE / sector_size;
++		mbr = read_part_sector(state, sector, &sect);
++		if (!mbr) {
++			printk(KERN_ERR "Dev Sunxi %s %s header: error reading sector %d\n",
++					MBR_MAGIC, b, sector);
++			goto error;
++		}
++		iv = (crc32_le(iv, (__u8 *)mbr, chunk));
++		calculated += chunk;
++	}
++
++	if ((crc ^ CRC_MAGIC) != iv) {
++		printk(KERN_WARNING "Dev Sunxi %s %s header: CRC bad for MBR %d\n",
++				MBR_MAGIC, b, no);
++		goto error;
++	}
++
++	goto done;
++
++error:
++	no = 0;
++done:
++	put_dev_sector(sect);
++	return no;
++}
++
++static void sunxi_nand_parse_mbr(struct parsed_partitions *state, int no)
++{
++	Sector sect;
++	int part_cnt;
++	struct MBR *mbr = 0;
++	char b[BDEVNAME_SIZE];
++
++	bdevname(state->bdev, b);
++
++	mbr = read_part_sector(state, mbr_sector, &sect);
++	for (part_cnt = 0; part_cnt < mbr->tag.PartCount &&
++			/* the sunxi mbr structure ver 0x200 allows for 120
++			 * partitions but only 31 fit into a page so forget the
++			 * ones that do not fit. */
++			part_cnt < MAX_PART_COUNT && part_cnt < 31;
++			part_cnt++) {
++		/* special case: last partition uses up rest of NAND space */
++		__u32 size = mbr->array[part_cnt].lenlo;
++		if (part_cnt == mbr->tag.PartCount - 1)
++			size = get_capacity(state->bdev->bd_disk) -
++				mbr->array[part_cnt].addrlo;
++		printk(KERN_WARNING "Dev Sunxi %s %s: part %d, start %d, size %d\n",
++			MBR_MAGIC, b, part_cnt + 1,
++			mbr->array[part_cnt].addrlo, size);
++		put_partition(state, part_cnt + 1,
++				mbr->array[part_cnt].addrlo, size);
++	}
++	strlcat(state->pp_buf, "\n", PAGE_SIZE);
++	put_dev_sector(sect);
++}
++
++int sunxi_nand_partition(struct parsed_partitions *state)
++{
++	int valid_mbr = 0;
++	int mbr;
++	int i;
++
++	for (i = 1; i <= MBR_COPY_NUM; i++, mbr++) {
++		mbr = sunxi_nand_validate_mbr(state, i);
++		if (mbr)
++			valid_mbr = mbr;
++	}
++
++	if (!valid_mbr) {
++		char b[BDEVNAME_SIZE];
++
++		bdevname(state->bdev, b);
++		printk(KERN_WARNING "Dev Sunxi %s %s header bad for all MBR copies, MBR corrupted or not present.\n",
++				MBR_MAGIC, b);
++		return 0;
++	}
++
++	sunxi_nand_parse_mbr(state, valid_mbr);
++
++	return 1;
++}
+diff --git a/block/partitions/sunxi_nand.h b/block/partitions/sunxi_nand.h
+new file mode 100644
+index 0000000..718c0f7
+--- /dev/null
++++ b/block/partitions/sunxi_nand.h
+@@ -0,0 +1,6 @@
++/*
++ *  fs/partitions/sunxi_nand.h
++ */
++
++int sunxi_nand311_partition(struct parsed_partitions *state);
++int sunxi_nand411_partition(struct parsed_partitions *state);
+diff --git a/block/partitions/sunxi_nand311.c b/block/partitions/sunxi_nand311.c
+new file mode 100644
+index 0000000..e98aa45
+--- /dev/null
++++ b/block/partitions/sunxi_nand311.c
+@@ -0,0 +1,3 @@
++#include <plat/mbr311.h>
++#define sunxi_nand_partition sunxi_nand311_partition
++#include "sunxi_nand.c"
+diff --git a/block/partitions/sunxi_nand411.c b/block/partitions/sunxi_nand411.c
+new file mode 100644
+index 0000000..72c07ec
+--- /dev/null
++++ b/block/partitions/sunxi_nand411.c
+@@ -0,0 +1,3 @@
++#include <plat/mbr411.h>
++#define sunxi_nand_partition sunxi_nand411_partition
++#include "sunxi_nand.c"

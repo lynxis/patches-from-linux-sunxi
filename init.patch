@@ -1,0 +1,42 @@
+diff --git a/init/Kconfig b/init/Kconfig
+index 6cfd71d..a7cffc8 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -953,6 +953,12 @@ config SYSCTL
+ config ANON_INODES
+ 	bool
+ 
++config PANIC_TIMEOUT
++	int "Default panic timeout"
++	default 0
++	help
++	  Set default panic timeout.
++
+ menuconfig EXPERT
+ 	bool "Configure standard kernel features (expert users)"
+ 	# Unhide debug options, to make the on-by-default options visible
+diff --git a/init/do_mounts.c b/init/do_mounts.c
+index 42b0707..7b81405 100644
+--- a/init/do_mounts.c
++++ b/init/do_mounts.c
+@@ -223,6 +223,20 @@ dev_t name_to_dev_t(char *name)
+ 	if (res)
+ 		goto done;
+ 
++#ifdef CONFIG_SUNXI_NAND_COMPAT_DEV
++	/*
++	 * sun6i new partitioning scheme allows for 120 partitions but what
++	 * they would be named is a mystery.
++	 * Make 26 first a-z partitions bootable.
++	 */
++	if (!strncmp(name, "nand", 4)
++	    && name[4] >= 'a' && name[4] <= 'z' && name[5] == 0) {
++		res = blk_lookup_devt("nand", name[4] - 'a' + 1);
++	if (res)
++		goto done;
++	}
++#endif
++
+ 	/*
+ 	 * try non-existent, but valid partition, which may only exist
+ 	 * after revalidating the disk, like partitioned md devices
