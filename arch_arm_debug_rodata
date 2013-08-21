@@ -1,0 +1,52 @@
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index 7fe19a3..26bec47 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -1896,6 +1957,15 @@ config DEPRECATED_PARAM_STRUCT
+ 	  This was deprecated in 2001 and announced to live on for 5 years.
+ 	  Some old boot loaders still use this way.
+ 
++config ARM_FLUSH_CONSOLE_ON_RESTART
++	bool "Force flush the console on restart"
++	help
++	  If the console is locked while the system is rebooted, the messages
++	  in the temporary logbuffer would not have propogated to all the
++	  console drivers. This option forces the console lock to be
++	  released if it failed to be acquired, which will cause all the
++	  pending messages to be flushed.
++
+ endmenu
+ 
+ menu "Boot options"
+diff --git a/arch/arm/Kconfig.debug b/arch/arm/Kconfig.debug
+index 85348a0..037bd5a 100644
+--- a/arch/arm/Kconfig.debug
++++ b/arch/arm/Kconfig.debug
+@@ -63,6 +63,27 @@ config DEBUG_USER
+ 	      8 - SIGSEGV faults
+ 	     16 - SIGBUS faults
+ 
++config DEBUG_RODATA
++	bool "Write protect kernel text section"
++	default n
++	depends on DEBUG_KERNEL && MMU
++	---help---
++	  Mark the kernel text section as write-protected in the pagetables,
++	  in order to catch accidental (and incorrect) writes to such const
++	  data. This will cause the size of the kernel, plus up to 4MB, to
++	  be mapped as pages instead of sections, which will increase TLB
++	  pressure.
++	  If in doubt, say "N".
++
++config DEBUG_RODATA_TEST
++	bool "Testcase for the DEBUG_RODATA feature"
++	depends on DEBUG_RODATA
++	default n
++	---help---
++	  This option enables a testcase for the DEBUG_RODATA
++	  feature.
++	  If in doubt, say "N"
++
+ # These options are only for real kernel hackers who want to get their hands dirty.
+ config DEBUG_LL
+ 	bool "Kernel low-level debugging functions (read help!)"
