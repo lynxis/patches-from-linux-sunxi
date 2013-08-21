@@ -1,0 +1,62 @@
+diff --git a/net/wireless/Kconfig b/net/wireless/Kconfig
+index 2e4444f..8db24da 100644
+--- a/net/wireless/Kconfig
++++ b/net/wireless/Kconfig
+@@ -160,3 +160,14 @@ config LIB80211_DEBUG
+ 	  from lib80211.
+ 
+ 	  If unsure, say N.
++
++config CFG80211_ALLOW_RECONNECT
++	bool "Allow reconnect while already connected"
++	depends on CFG80211
++	default n
++	help
++	  cfg80211 stack doesn't allow to connect if you are already
++	  connected. This option allows to make a connection in this case.
++
++	  Select this option ONLY for wlan drivers that are specifically
++	  built for such purposes.
+diff --git a/net/wireless/scan.c b/net/wireless/scan.c
+index 70faadf..e40104f 100644
+--- a/net/wireless/scan.c
++++ b/net/wireless/scan.c
+@@ -18,7 +18,7 @@
+ #include "nl80211.h"
+ #include "wext-compat.h"
+ 
+-#define IEEE80211_SCAN_RESULT_EXPIRE	(15 * HZ)
++#define IEEE80211_SCAN_RESULT_EXPIRE	(3 * HZ)
+ 
+ void ___cfg80211_scan_done(struct cfg80211_registered_device *rdev, bool leak)
+ {
+diff --git a/net/wireless/sme.c b/net/wireless/sme.c
+index f7e937f..bbbed73 100644
+--- a/net/wireless/sme.c
++++ b/net/wireless/sme.c
+@@ -689,8 +689,10 @@ void __cfg80211_disconnected(struct net_device *dev, const u8 *ie,
+ 		    wdev->iftype != NL80211_IFTYPE_P2P_CLIENT))
+ 		return;
+ 
++#ifndef CONFIG_CFG80211_ALLOW_RECONNECT
+ 	if (wdev->sme_state != CFG80211_SME_CONNECTED)
+ 		return;
++#endif
+ 
+ 	if (wdev->current_bss) {
+ 		cfg80211_unhold_bss(wdev->current_bss);
+@@ -767,10 +769,14 @@ int __cfg80211_connect(struct cfg80211_registered_device *rdev,
+ 
+ 	ASSERT_WDEV_LOCK(wdev);
+ 
++#ifndef CONFIG_CFG80211_ALLOW_RECONNECT
+ 	if (wdev->sme_state != CFG80211_SME_IDLE)
+ 		return -EALREADY;
+ 
+ 	if (WARN_ON(wdev->connect_keys)) {
++#else
++	if (wdev->connect_keys) {
++#endif
+ 		kfree(wdev->connect_keys);
+ 		wdev->connect_keys = NULL;
+ 	}

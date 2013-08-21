@@ -1,0 +1,408 @@
+diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
+index ff75d3b..c6f177c 100644
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -14,6 +14,7 @@ obj-y     := route.o inetpeer.o protocol.o \
+ 	     inet_fragment.o ping.o
+ 
+ obj-$(CONFIG_SYSCTL) += sysctl_net_ipv4.o
++obj-$(CONFIG_SYSFS) += sysfs_net_ipv4.o
+ obj-$(CONFIG_PROC_FS) += proc.o
+ obj-$(CONFIG_IP_MULTIPLE_TABLES) += fib_rules.o
+ obj-$(CONFIG_IP_MROUTE) += ipmr.o
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 78ec298..de5ec03 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -119,6 +119,19 @@
+ #include <linux/mroute.h>
+ #endif
+ 
++#ifdef CONFIG_ANDROID_PARANOID_NETWORK
++#include <linux/android_aid.h>
++
++static inline int current_has_network(void)
++{
++	return in_egroup_p(AID_INET) || capable(CAP_NET_RAW);
++}
++#else
++static inline int current_has_network(void)
++{
++	return 1;
++}
++#endif
+ 
+ /* The inetsw table contains everything that inet_create needs to
+  * build a new socket.
+@@ -264,6 +277,7 @@ static inline int inet_netns_ok(struct net *net, int protocol)
+ 	return ipprot->netns_ok;
+ }
+ 
++
+ /*
+  *	Create an inet socket.
+  */
+@@ -280,6 +294,9 @@ static int inet_create(struct net *net, struct socket *sock, int protocol,
+ 	int try_loading_module = 0;
+ 	int err;
+ 
++	if (!current_has_network())
++		return -EACCES;
++
+ 	if (unlikely(!inet_ehash_secret))
+ 		if (sock->type != SOCK_RAW && sock->type != SOCK_DGRAM)
+ 			build_ehash_secret();
+@@ -886,6 +903,7 @@ int inet_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
+ 	case SIOCSIFPFLAGS:
+ 	case SIOCGIFPFLAGS:
+ 	case SIOCSIFFLAGS:
++	case SIOCKILLADDR:
+ 		err = devinet_ioctl(net, cmd, (void __user *)arg);
+ 		break;
+ 	default:
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index 6e447ff..8a9aab3 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -58,6 +58,7 @@
+ 
+ #include <net/arp.h>
+ #include <net/ip.h>
++#include <net/tcp.h>
+ #include <net/route.h>
+ #include <net/ip_fib.h>
+ #include <net/rtnetlink.h>
+@@ -734,6 +735,7 @@ int devinet_ioctl(struct net *net, unsigned int cmd, void __user *arg)
+ 	case SIOCSIFBRDADDR:	/* Set the broadcast address */
+ 	case SIOCSIFDSTADDR:	/* Set the destination address */
+ 	case SIOCSIFNETMASK: 	/* Set the netmask for the interface */
++	case SIOCKILLADDR:	/* Nuke all sockets on this address */
+ 		ret = -EACCES;
+ 		if (!capable(CAP_NET_ADMIN))
+ 			goto out;
+@@ -785,7 +787,8 @@ int devinet_ioctl(struct net *net, unsigned int cmd, void __user *arg)
+ 	}
+ 
+ 	ret = -EADDRNOTAVAIL;
+-	if (!ifa && cmd != SIOCSIFADDR && cmd != SIOCSIFFLAGS)
++	if (!ifa && cmd != SIOCSIFADDR && cmd != SIOCSIFFLAGS
++	    && cmd != SIOCKILLADDR)
+ 		goto done;
+ 
+ 	switch (cmd) {
+@@ -911,6 +914,9 @@ int devinet_ioctl(struct net *net, unsigned int cmd, void __user *arg)
+ 			inet_insert_ifa(ifa);
+ 		}
+ 		break;
++	case SIOCKILLADDR:	/* Nuke all connections on this address */
++		ret = tcp_nuke_addr(net, (struct sockaddr *) sin);
++		break;
+ 	}
+ done:
+ 	rtnl_unlock();
+diff --git a/net/ipv4/netfilter/Kconfig b/net/ipv4/netfilter/Kconfig
+index fcc543c..a1dce8a 100644
+--- a/net/ipv4/netfilter/Kconfig
++++ b/net/ipv4/netfilter/Kconfig
+@@ -123,6 +123,18 @@ config IP_NF_TARGET_REJECT
+ 
+ 	  To compile it as a module, choose M here.  If unsure, say N.
+ 
++config IP_NF_TARGET_REJECT_SKERR
++	bool "Force socket error when rejecting with icmp*"
++	depends on IP_NF_TARGET_REJECT
++	default n
++	help
++          This option enables turning a "--reject-with icmp*" into a matching
++          socket error also.
++	  The REJECT target normally allows sending an ICMP message. But it
++          leaves the local socket unaware of any ingress rejects.
++
++	  If unsure, say N.
++
+ config IP_NF_TARGET_ULOG
+ 	tristate "ULOG target support"
+ 	default m if NETFILTER_ADVANCED=n
+diff --git a/net/ipv4/netfilter/ipt_REJECT.c b/net/ipv4/netfilter/ipt_REJECT.c
+index 51f13f8..9dd754c 100644
+--- a/net/ipv4/netfilter/ipt_REJECT.c
++++ b/net/ipv4/netfilter/ipt_REJECT.c
+@@ -128,6 +128,14 @@ static void send_reset(struct sk_buff *oldskb, int hook)
+ static inline void send_unreach(struct sk_buff *skb_in, int code)
+ {
+ 	icmp_send(skb_in, ICMP_DEST_UNREACH, code, 0);
++#ifdef CONFIG_IP_NF_TARGET_REJECT_SKERR
++	if (skb_in->sk) {
++		skb_in->sk->sk_err = icmp_err_convert[code].errno;
++		skb_in->sk->sk_error_report(skb_in->sk);
++		pr_debug("ipt_REJECT: sk_err=%d for skb=%p sk=%p\n",
++			skb_in->sk->sk_err, skb_in, skb_in->sk);
++	}
++#endif
+ }
+ 
+ static unsigned int
+diff --git a/net/ipv4/sysfs_net_ipv4.c b/net/ipv4/sysfs_net_ipv4.c
+new file mode 100644
+index 0000000..0cbbf10
+--- /dev/null
++++ b/net/ipv4/sysfs_net_ipv4.c
+@@ -0,0 +1,88 @@
++/*
++ * net/ipv4/sysfs_net_ipv4.c
++ *
++ * sysfs-based networking knobs (so we can, unlike with sysctl, control perms)
++ *
++ * Copyright (C) 2008 Google, Inc.
++ *
++ * Robert Love <rlove@google.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/kobject.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/init.h>
++#include <net/tcp.h>
++
++#define CREATE_IPV4_FILE(_name, _var) \
++static ssize_t _name##_show(struct kobject *kobj, \
++			    struct kobj_attribute *attr, char *buf) \
++{ \
++	return sprintf(buf, "%d\n", _var); \
++} \
++static ssize_t _name##_store(struct kobject *kobj, \
++			     struct kobj_attribute *attr, \
++			     const char *buf, size_t count) \
++{ \
++	int val, ret; \
++	ret = sscanf(buf, "%d", &val); \
++	if (ret != 1) \
++		return -EINVAL; \
++	if (val < 0) \
++		return -EINVAL; \
++	_var = val; \
++	return count; \
++} \
++static struct kobj_attribute _name##_attr = \
++	__ATTR(_name, 0644, _name##_show, _name##_store)
++
++CREATE_IPV4_FILE(tcp_wmem_min, sysctl_tcp_wmem[0]);
++CREATE_IPV4_FILE(tcp_wmem_def, sysctl_tcp_wmem[1]);
++CREATE_IPV4_FILE(tcp_wmem_max, sysctl_tcp_wmem[2]);
++
++CREATE_IPV4_FILE(tcp_rmem_min, sysctl_tcp_rmem[0]);
++CREATE_IPV4_FILE(tcp_rmem_def, sysctl_tcp_rmem[1]);
++CREATE_IPV4_FILE(tcp_rmem_max, sysctl_tcp_rmem[2]);
++
++static struct attribute *ipv4_attrs[] = {
++	&tcp_wmem_min_attr.attr,
++	&tcp_wmem_def_attr.attr,
++	&tcp_wmem_max_attr.attr,
++	&tcp_rmem_min_attr.attr,
++	&tcp_rmem_def_attr.attr,
++	&tcp_rmem_max_attr.attr,
++	NULL
++};
++
++static struct attribute_group ipv4_attr_group = {
++	.attrs = ipv4_attrs,
++};
++
++static __init int sysfs_ipv4_init(void)
++{
++	struct kobject *ipv4_kobject;
++	int ret;
++
++	ipv4_kobject = kobject_create_and_add("ipv4", kernel_kobj);
++	if (!ipv4_kobject)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(ipv4_kobject, &ipv4_attr_group);
++	if (ret) {
++		kobject_put(ipv4_kobject);
++		return ret;
++	}
++
++	return 0;
++}
++
++subsys_initcall(sysfs_ipv4_init);
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index dcb19f5..67f7934 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -268,11 +268,15 @@
+ #include <linux/crypto.h>
+ #include <linux/time.h>
+ #include <linux/slab.h>
++#include <linux/uid_stat.h>
+ 
+ #include <net/icmp.h>
+ #include <net/tcp.h>
+ #include <net/xfrm.h>
+ #include <net/ip.h>
++#include <net/ip6_route.h>
++#include <net/ipv6.h>
++#include <net/transp_v6.h>
+ #include <net/netdma.h>
+ #include <net/sock.h>
+ 
+@@ -1115,6 +1119,9 @@ out:
+ 	if (copied)
+ 		tcp_push(sk, flags, mss_now, tp->nonagle);
+ 	release_sock(sk);
++
++	if (copied > 0)
++		uid_stat_tcp_snd(current_uid(), copied);
+ 	return copied;
+ 
+ do_fault:
+@@ -1389,8 +1396,11 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+ 	tcp_rcv_space_adjust(sk);
+ 
+ 	/* Clean up data we have read: This will do ACK frames. */
+-	if (copied > 0)
++	if (copied > 0) {
+ 		tcp_cleanup_rbuf(sk, copied);
++		uid_stat_tcp_rcv(current_uid(), copied);
++	}
++
+ 	return copied;
+ }
+ EXPORT_SYMBOL(tcp_read_sock);
+@@ -1779,6 +1789,9 @@ skip_copy:
+ 	tcp_cleanup_rbuf(sk, copied);
+ 
+ 	release_sock(sk);
++
++	if (copied > 0)
++		uid_stat_tcp_rcv(current_uid(), copied);
+ 	return copied;
+ 
+ out:
+@@ -1787,6 +1800,8 @@ out:
+ 
+ recv_urg:
+ 	err = tcp_recv_urg(sk, msg, len, flags);
++	if (err > 0)
++		uid_stat_tcp_rcv(current_uid(), err);
+ 	goto out;
+ }
+ EXPORT_SYMBOL(tcp_recvmsg);
+@@ -3336,3 +3351,107 @@ void __init tcp_init(void)
+ 	tcp_secret_retiring = &tcp_secret_two;
+ 	tcp_secret_secondary = &tcp_secret_two;
+ }
++
++static int tcp_is_local(struct net *net, __be32 addr) {
++	struct rtable *rt;
++	struct flowi4 fl4 = { .daddr = addr };
++	rt = ip_route_output_key(net, &fl4);
++	if (IS_ERR_OR_NULL(rt))
++		return 0;
++	return rt->dst.dev && (rt->dst.dev->flags & IFF_LOOPBACK);
++}
++
++#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
++static int tcp_is_local6(struct net *net, struct in6_addr *addr) {
++	struct rt6_info *rt6 = rt6_lookup(net, addr, addr, 0, 0);
++	return rt6 && rt6->dst.dev && (rt6->dst.dev->flags & IFF_LOOPBACK);
++}
++#endif
++
++/*
++ * tcp_nuke_addr - destroy all sockets on the given local address
++ * if local address is the unspecified address (0.0.0.0 or ::), destroy all
++ * sockets with local addresses that are not configured.
++ */
++int tcp_nuke_addr(struct net *net, struct sockaddr *addr)
++{
++	int family = addr->sa_family;
++	unsigned int bucket;
++
++	struct in_addr *in;
++#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
++	struct in6_addr *in6;
++#endif
++	if (family == AF_INET) {
++		in = &((struct sockaddr_in *)addr)->sin_addr;
++#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
++	} else if (family == AF_INET6) {
++		in6 = &((struct sockaddr_in6 *)addr)->sin6_addr;
++#endif
++	} else {
++		return -EAFNOSUPPORT;
++	}
++
++	for (bucket = 0; bucket < tcp_hashinfo.ehash_mask; bucket++) {
++		struct hlist_nulls_node *node;
++		struct sock *sk;
++		spinlock_t *lock = inet_ehash_lockp(&tcp_hashinfo, bucket);
++
++restart:
++		spin_lock_bh(lock);
++		sk_nulls_for_each(sk, node, &tcp_hashinfo.ehash[bucket].chain) {
++			struct inet_sock *inet = inet_sk(sk);
++
++			if (sysctl_ip_dynaddr && sk->sk_state == TCP_SYN_SENT)
++				continue;
++			if (sock_flag(sk, SOCK_DEAD))
++				continue;
++
++			if (family == AF_INET) {
++				__be32 s4 = inet->inet_rcv_saddr;
++				if (s4 == LOOPBACK4_IPV6)
++					continue;
++
++				if (in->s_addr != s4 &&
++				    !(in->s_addr == INADDR_ANY &&
++				      !tcp_is_local(net, s4)))
++					continue;
++			}
++
++#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
++			if (family == AF_INET6) {
++				struct in6_addr *s6;
++				if (!inet->pinet6)
++					continue;
++
++				s6 = &inet->pinet6->rcv_saddr;
++				if (ipv6_addr_type(s6) == IPV6_ADDR_MAPPED)
++					continue;
++
++				if (!ipv6_addr_equal(in6, s6) &&
++				    !(ipv6_addr_equal(in6, &in6addr_any) &&
++				      !tcp_is_local6(net, s6)))
++				continue;
++			}
++#endif
++
++			sock_hold(sk);
++			spin_unlock_bh(lock);
++
++			local_bh_disable();
++			bh_lock_sock(sk);
++			sk->sk_err = ETIMEDOUT;
++			sk->sk_error_report(sk);
++
++			tcp_done(sk);
++			bh_unlock_sock(sk);
++			local_bh_enable();
++			sock_put(sk);
++
++			goto restart;
++		}
++		spin_unlock_bh(lock);
++	}
++
++	return 0;
++}
