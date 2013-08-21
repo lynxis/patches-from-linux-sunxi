@@ -1,0 +1,204 @@
+diff --git a/security/capability.c b/security/capability.c
+index 5bb21b1..fc991bc 100644
+--- a/security/capability.c
++++ b/security/capability.c
+@@ -12,6 +12,26 @@
+ 
+ #include <linux/security.h>
+ 
++static int cap_binder_set_context_mgr(struct task_struct *mgr)
++{
++	return 0;
++}
++
++static int cap_binder_transaction(struct task_struct *from, struct task_struct *to)
++{
++	return 0;
++}
++
++static int cap_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
++{
++	return 0;
++}
++
++static int cap_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
++{
++	return 0;
++}
++
+ static int cap_syslog(int type)
+ {
+ 	return 0;
+@@ -877,6 +897,10 @@ static void cap_audit_rule_free(void *lsmrule)
+ 
+ void __init security_fixup_ops(struct security_operations *ops)
+ {
++	set_to_cap_if_null(ops, binder_set_context_mgr);
++	set_to_cap_if_null(ops, binder_transaction);
++	set_to_cap_if_null(ops, binder_transfer_binder);
++	set_to_cap_if_null(ops, binder_transfer_file);
+ 	set_to_cap_if_null(ops, ptrace_access_check);
+ 	set_to_cap_if_null(ops, ptrace_traceme);
+ 	set_to_cap_if_null(ops, capget);
+diff --git a/security/commoncap.c b/security/commoncap.c
+index 71a166a..0051ac2 100644
+--- a/security/commoncap.c
++++ b/security/commoncap.c
+@@ -31,6 +31,10 @@
+ #include <linux/binfmts.h>
+ #include <linux/personality.h>
+ 
++#ifdef CONFIG_ANDROID_PARANOID_NETWORK
++#include <linux/android_aid.h>
++#endif
++
+ /*
+  * If a non-root user executes a setuid-root binary in
+  * !secure(SECURE_NOROOT) mode, then we raise capabilities.
+@@ -76,6 +80,13 @@ int cap_netlink_send(struct sock *sk, struct sk_buff *skb)
+ int cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
+ 		int cap, int audit)
+ {
++#ifdef CONFIG_ANDROID_PARANOID_NETWORK
++	if (cap == CAP_NET_RAW && in_egroup_p(AID_NET_RAW))
++		return 0;
++	if (cap == CAP_NET_ADMIN && in_egroup_p(AID_NET_ADMIN))
++		return 0;
++#endif
++
+ 	for (;;) {
+ 		/* The creator of the user namespace has all caps. */
+ 		if (targ_ns != &init_user_ns && targ_ns->creator == cred->user)
+diff --git a/security/security.c b/security/security.c
+index bf619ff..cecd55e 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -130,6 +130,26 @@ int __init register_security(struct security_operations *ops)
+ 
+ /* Security operations */
+ 
++int security_binder_set_context_mgr(struct task_struct *mgr)
++{
++	return security_ops->binder_set_context_mgr(mgr);
++}
++
++int security_binder_transaction(struct task_struct *from, struct task_struct *to)
++{
++	return security_ops->binder_transaction(from, to);
++}
++
++int security_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
++{
++	return security_ops->binder_transfer_binder(from, to);
++}
++
++int security_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
++{
++	return security_ops->binder_transfer_file(from, to, file);
++}
++
+ int security_ptrace_access_check(struct task_struct *child, unsigned int mode)
+ {
+ 	return security_ops->ptrace_access_check(child, mode);
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 5626222..1ae096e 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -1818,6 +1818,67 @@ static inline u32 open_file_to_av(struct file *file)
+ 
+ /* Hook functions begin here. */
+ 
++static int selinux_binder_set_context_mgr(struct task_struct *mgr)
++{
++	u32 mysid = current_sid();
++	u32 mgrsid = task_sid(mgr);
++
++	return avc_has_perm(mysid, mgrsid, SECCLASS_BINDER, BINDER__SET_CONTEXT_MGR, NULL);
++}
++
++static int selinux_binder_transaction(struct task_struct *from, struct task_struct *to)
++{
++	u32 mysid = current_sid();
++	u32 fromsid = task_sid(from);
++	u32 tosid = task_sid(to);
++	int rc;
++
++	if (mysid != fromsid) {
++		rc = avc_has_perm(mysid, fromsid, SECCLASS_BINDER, BINDER__IMPERSONATE, NULL);
++		if (rc)
++			return rc;
++	}
++
++	return avc_has_perm(fromsid, tosid, SECCLASS_BINDER, BINDER__CALL, NULL);
++}
++
++static int selinux_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
++{
++	u32 fromsid = task_sid(from);
++	u32 tosid = task_sid(to);
++	return avc_has_perm(fromsid, tosid, SECCLASS_BINDER, BINDER__TRANSFER, NULL);
++}
++
++static int selinux_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
++{
++	u32 sid = task_sid(to);
++	struct file_security_struct *fsec = file->f_security;
++	struct inode *inode = file->f_path.dentry->d_inode;
++	struct inode_security_struct *isec = inode->i_security;
++	struct common_audit_data ad;
++	struct selinux_audit_data sad = {0,};
++	int rc;
++
++	COMMON_AUDIT_DATA_INIT(&ad, PATH);
++	ad.u.path = file->f_path;
++	ad.selinux_audit_data = &sad;
++
++	if (sid != fsec->sid) {
++		rc = avc_has_perm(sid, fsec->sid,
++				  SECCLASS_FD,
++				  FD__USE,
++				  &ad);
++		if (rc)
++			return rc;
++	}
++
++	if (unlikely(IS_PRIVATE(inode)))
++		return 0;
++
++	return avc_has_perm(sid, isec->sid, isec->sclass, file_to_av(file),
++			    &ad);
++}
++
+ static int selinux_ptrace_access_check(struct task_struct *child,
+ 				     unsigned int mode)
+ {
+@@ -5523,6 +5584,11 @@ static int selinux_key_getsecurity(struct key *key, char **_buffer)
+ static struct security_operations selinux_ops = {
+ 	.name =				"selinux",
+ 
++	.binder_set_context_mgr =	selinux_binder_set_context_mgr,
++	.binder_transaction =		selinux_binder_transaction,
++	.binder_transfer_binder =	selinux_binder_transfer_binder,
++	.binder_transfer_file =		selinux_binder_transfer_file,
++
+ 	.ptrace_access_check =		selinux_ptrace_access_check,
+ 	.ptrace_traceme =		selinux_ptrace_traceme,
+ 	.capget =			selinux_capget,
+diff --git a/security/selinux/include/classmap.h b/security/selinux/include/classmap.h
+index b8c5372..d7afe19 100644
+--- a/security/selinux/include/classmap.h
++++ b/security/selinux/include/classmap.h
+@@ -145,9 +145,12 @@ struct security_class_mapping secclass_map[] = {
+ 	    "node_bind", "name_connect", NULL } },
+ 	{ "memprotect", { "mmap_zero", NULL } },
+ 	{ "peer", { "recv", NULL } },
+-	{ "capability2", { "mac_override", "mac_admin", "syslog", NULL } },
++	{ "capability2",
++	  { "mac_override", "mac_admin", "syslog", "wake_alarm",
++	    "block_suspend", NULL } },
+ 	{ "kernel_service", { "use_as_override", "create_files_as", NULL } },
+ 	{ "tun_socket",
+ 	  { COMMON_SOCK_PERMS, NULL } },
++	{ "binder", { "impersonate", "call", "set_context_mgr", "transfer", NULL } },
+ 	{ NULL }
+   };
