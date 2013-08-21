@@ -2,17 +2,6 @@ diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
 index a290be5..df63338 100644
 --- a/drivers/video/Kconfig
 +++ b/drivers/video/Kconfig
-@@ -23,6 +23,10 @@ source "drivers/gpu/drm/Kconfig"
- 
- source "drivers/gpu/stub/Kconfig"
- 
-+source "drivers/gpu/ion/Kconfig"
-+
-+source "drivers/gpu/mali/Kconfig"
-+
- config VGASTATE
-        tristate
-        default n
 @@ -268,6 +272,42 @@ config FB_GRVGA
  	---help---
  	This enables support for the SVGACTRL framebuffer in the GRLIB IP library from Aeroflex Gaisler.
