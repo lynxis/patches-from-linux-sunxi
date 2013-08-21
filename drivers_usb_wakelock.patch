@@ -1,0 +1,632 @@
+diff --git a/drivers/usb/otg/Kconfig b/drivers/usb/otg/Kconfig
+index 5c87db0..c2902a8 100644
+--- a/drivers/usb/otg/Kconfig
++++ b/drivers/usb/otg/Kconfig
+@@ -12,6 +12,14 @@ config USB_OTG_UTILS
+ 	  Select this to make sure the build includes objects from
+ 	  the OTG infrastructure directory.
+ 
++config USB_OTG_WAKELOCK
++	bool "Hold a wakelock when USB connected"
++	depends on WAKELOCK
++	select USB_OTG_UTILS
++	help
++	  Select this to automatically hold a wakelock when USB is
++	  connected, preventing suspend.
++
+ if USB || USB_GADGET
+ 
+ #
+diff --git a/drivers/usb/otg/Makefile b/drivers/usb/otg/Makefile
+index 41aa509..638d040 100644
+--- a/drivers/usb/otg/Makefile
++++ b/drivers/usb/otg/Makefile
+@@ -7,6 +7,7 @@ ccflags-$(CONFIG_USB_GADGET_DEBUG)	+= -DDEBUG
+ 
+ # infrastructure
+ obj-$(CONFIG_USB_OTG_UTILS)	+= otg.o
++obj-$(CONFIG_USB_OTG_WAKELOCK)	+= otg-wakelock.o
+ 
+ # transceiver drivers
+ obj-$(CONFIG_USB_GPIO_VBUS)	+= gpio_vbus.o
+diff --git a/drivers/usb/otg/otg-wakelock.c b/drivers/usb/otg/otg-wakelock.c
+new file mode 100644
+index 0000000..e17e272
+--- /dev/null
++++ b/drivers/usb/otg/otg-wakelock.c
+@@ -0,0 +1,170 @@
++/*
++ * otg-wakelock.c
++ *
++ * Copyright (C) 2011 Google, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/notifier.h>
++#include <linux/wakelock.h>
++#include <linux/spinlock.h>
++#include <linux/usb/otg.h>
++
++#define TEMPORARY_HOLD_TIME	2000
++
++static bool enabled = true;
++static struct usb_phy *otgwl_xceiv;
++static struct notifier_block otgwl_nb;
++
++/*
++ * otgwl_spinlock is held while the VBUS lock is grabbed or dropped and the
++ * held field is updated to match.
++ */
++
++static DEFINE_SPINLOCK(otgwl_spinlock);
++
++/*
++ * Only one lock, but since these 3 fields are associated with each other...
++ */
++
++struct otgwl_lock {
++	char name[40];
++	struct wake_lock wakelock;
++	bool held;
++};
++
++/*
++ * VBUS present lock.  Also used as a timed lock on charger
++ * connect/disconnect and USB host disconnect, to allow the system
++ * to react to the change in power.
++ */
++
++static struct otgwl_lock vbus_lock;
++
++static void otgwl_hold(struct otgwl_lock *lock)
++{
++	if (!lock->held) {
++		wake_lock(&lock->wakelock);
++		lock->held = true;
++	}
++}
++
++static void otgwl_temporary_hold(struct otgwl_lock *lock)
++{
++	wake_lock_timeout(&lock->wakelock,
++			  msecs_to_jiffies(TEMPORARY_HOLD_TIME));
++	lock->held = false;
++}
++
++static void otgwl_drop(struct otgwl_lock *lock)
++{
++	if (lock->held) {
++		wake_unlock(&lock->wakelock);
++		lock->held = false;
++	}
++}
++
++static void otgwl_handle_event(unsigned long event)
++{
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&otgwl_spinlock, irqflags);
++
++	if (!enabled) {
++		otgwl_drop(&vbus_lock);
++		spin_unlock_irqrestore(&otgwl_spinlock, irqflags);
++		return;
++	}
++
++	switch (event) {
++	case USB_EVENT_VBUS:
++	case USB_EVENT_ENUMERATED:
++		otgwl_hold(&vbus_lock);
++		break;
++
++	case USB_EVENT_NONE:
++	case USB_EVENT_ID:
++	case USB_EVENT_CHARGER:
++		otgwl_temporary_hold(&vbus_lock);
++		break;
++
++	default:
++		break;
++	}
++
++	spin_unlock_irqrestore(&otgwl_spinlock, irqflags);
++}
++
++static int otgwl_otg_notifications(struct notifier_block *nb,
++				   unsigned long event, void *unused)
++{
++	otgwl_handle_event(event);
++	return NOTIFY_OK;
++}
++
++static int set_enabled(const char *val, const struct kernel_param *kp)
++{
++	int rv = param_set_bool(val, kp);
++
++	if (rv)
++		return rv;
++
++	if (otgwl_xceiv)
++		otgwl_handle_event(otgwl_xceiv->last_event);
++
++	return 0;
++}
++
++static struct kernel_param_ops enabled_param_ops = {
++	.set = set_enabled,
++	.get = param_get_bool,
++};
++
++module_param_cb(enabled, &enabled_param_ops, &enabled, 0644);
++MODULE_PARM_DESC(enabled, "enable wakelock when VBUS present");
++
++static int __init otg_wakelock_init(void)
++{
++	int ret;
++
++	otgwl_xceiv = usb_get_transceiver();
++
++	if (!otgwl_xceiv) {
++		pr_err("%s: No USB transceiver found\n", __func__);
++		return -ENODEV;
++	}
++
++	snprintf(vbus_lock.name, sizeof(vbus_lock.name), "vbus-%s",
++		 dev_name(otgwl_xceiv->dev));
++	wake_lock_init(&vbus_lock.wakelock, WAKE_LOCK_SUSPEND,
++		       vbus_lock.name);
++
++	otgwl_nb.notifier_call = otgwl_otg_notifications;
++	ret = usb_register_notifier(otgwl_xceiv, &otgwl_nb);
++
++	if (ret) {
++		pr_err("%s: usb_register_notifier on transceiver %s"
++		       " failed\n", __func__,
++		       dev_name(otgwl_xceiv->dev));
++		otgwl_xceiv = NULL;
++		wake_lock_destroy(&vbus_lock.wakelock);
++		return ret;
++	}
++
++	otgwl_handle_event(otgwl_xceiv->last_event);
++	return ret;
++}
++
++late_initcall(otg_wakelock_init);
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index 78c4774..58a2c65 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -84,6 +84,15 @@ static void option_instat_callback(struct urb *urb);
+ #define HUAWEI_PRODUCT_K4505			0x1464
+ #define HUAWEI_PRODUCT_K3765			0x1465
+ #define HUAWEI_PRODUCT_K4605			0x14C6
++#define HUAWEI_PRODUCT_K5005			0x14C8
++#define HUAWEI_PRODUCT_K3770			0x14C9
++#define HUAWEI_PRODUCT_K3771			0x14CA
++#define HUAWEI_PRODUCT_K4510			0x14CB
++#define HUAWEI_PRODUCT_K4511			0x14CC
++#define HUAWEI_PRODUCT_ETS1220			0x1803
++#define HUAWEI_PRODUCT_E353			0x1506
++#define HUAWEI_PRODUCT_E173S			0x1C05
++#define HUAWEI_PRODUCT_ET128			0x1D09
+ 
+ #define QUANTA_VENDOR_ID			0x0408
+ #define QUANTA_PRODUCT_Q101			0xEA02
+@@ -231,6 +240,7 @@ static void option_instat_callback(struct urb *urb);
+ #define BANDRICH_PRODUCT_1012			0x1012
+ 
+ #define QUALCOMM_VENDOR_ID			0x05C6
++#define QUALCOMM_ASB_C820			0x00a0	//ASB use QUALCOMM ic dongle
+ 
+ #define CMOTECH_VENDOR_ID			0x16d8
+ #define CMOTECH_PRODUCT_6008			0x6008
+@@ -257,6 +267,10 @@ static void option_instat_callback(struct urb *urb);
+ #define ZTE_PRODUCT_AD3812			0xffeb
+ #define ZTE_PRODUCT_MC2716			0xffed
+ 
++/* ZTE PRODUCTS -- alternate vendor ID */
++#define ZTE_VENDOR_ID2				0x1d6b
++#define ZTE_PRODUCT_MF_330			0x0002
++
+ #define BENQ_VENDOR_ID				0x04a5
+ #define BENQ_PRODUCT_H10			0x4068
+ 
+@@ -287,6 +301,7 @@ static void option_instat_callback(struct urb *urb);
+ 
+ /* ALCATEL PRODUCTS */
+ #define ALCATEL_VENDOR_ID			0x1bbb
++#define ALCATEL_PRODUCT_X060S			0x0000
+ #define ALCATEL_PRODUCT_X060S_X200		0x0000
+ #define ALCATEL_PRODUCT_X220_X500D		0x0017
+ #define ALCATEL_PRODUCT_L100V			0x011e
+@@ -448,6 +463,32 @@ static void option_instat_callback(struct urb *urb);
+ #define CELLIENT_VENDOR_ID			0x2692
+ #define CELLIENT_PRODUCT_MEN200			0x9005
+ 
++/* Vtion Information Technology (Fujian) */
++#define VTION_VENDOR_ID			0x1E89
++#define VTION_PRODUCT_E1916		0x1E16 //evdo ???
++
++/* PuChuang WCDMA */
++#define PUCHUANG_VENDOR_ID			0x20A6
++#define PUCHUANG_PRODUCT_E003		0x1105 //wcdma
++
++/* JIN YU SHI KONG Communication,evdo */
++#define SRT_VENDOR_ID			0x1D09
++#define SRT_PRODUCT_SRTE800		0xAEF4 // evdo
++
++/* A100 ???,evdo */
++#define AXX_VENDOR_ID			0x21F5
++#define AXXT_PRODUCT_XXX		0x2008 // evdo
++
++/*shangshai ASB products*/
++#define ASB_VENDOR_ID			0x04cc
++#define ASB_PRODUCT_T920		0x226e
++#define ASB_PRODUCT_TU930			0x225a
++
++/*TechFaith products*/
++#define TechFaith_VENDOR_ID		0x1d09
++#define TechFaith_PRODUCT_HSDPA		0x1010
++#define TechFaith_PRODUCT_SRTE800	0xAEF4
++
+ /* Hyundai Petatel Inc. products */
+ #define PETATEL_VENDOR_ID			0x1ff4
+ #define PETATEL_PRODUCT_NP10T			0x600e
+@@ -703,7 +744,6 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0xff, 0x02, 0x7B) },
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0xff, 0x02, 0x7C) },
+ 
+-
+ 	{ USB_DEVICE(NOVATELWIRELESS_VENDOR_ID, NOVATELWIRELESS_PRODUCT_V640) },
+ 	{ USB_DEVICE(NOVATELWIRELESS_VENDOR_ID, NOVATELWIRELESS_PRODUCT_V620) },
+ 	{ USB_DEVICE(NOVATELWIRELESS_VENDOR_ID, NOVATELWIRELESS_PRODUCT_V740) },
+@@ -813,6 +853,7 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0004, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0005, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0006, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0007, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0008, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0009, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x000a, 0xff, 0xff, 0xff) },
+@@ -1242,6 +1283,7 @@ static const struct usb_device_id option_ids[] = {
+   	},
+ 	{ USB_DEVICE(LONGCHEER_VENDOR_ID, ZOOM_PRODUCT_4597) },
+ 	{ USB_DEVICE(HAIER_VENDOR_ID, HAIER_PRODUCT_CE100) },
++	{ USB_DEVICE(VTION_VENDOR_ID, 0x1a20) },
+ 	/* Pirelli  */
+ 	{ USB_DEVICE(PIRELLI_VENDOR_ID, PIRELLI_PRODUCT_C100_1)},
+ 	{ USB_DEVICE(PIRELLI_VENDOR_ID, PIRELLI_PRODUCT_C100_2)},
+@@ -1346,6 +1388,15 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(MEDIATEK_VENDOR_ID, MEDIATEK_PRODUCT_DC_4COM2, 0xff, 0x02, 0x01) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(MEDIATEK_VENDOR_ID, MEDIATEK_PRODUCT_DC_4COM2, 0xff, 0x00, 0x00) },
+ 	{ USB_DEVICE(CELLIENT_VENDOR_ID, CELLIENT_PRODUCT_MEN200) },
++	{ USB_DEVICE(AXX_VENDOR_ID,   AXXT_PRODUCT_XXX)   },
++	{ USB_DEVICE(SRT_VENDOR_ID,   SRT_PRODUCT_SRTE800)},
++	{ USB_DEVICE(PUCHUANG_VENDOR_ID,PUCHUANG_PRODUCT_E003)},
++	{ USB_DEVICE(VTION_VENDOR_ID,   VTION_PRODUCT_E1916)   },
++	{ USB_DEVICE(QUALCOMM_VENDOR_ID,   QUALCOMM_ASB_C820)},
++	{ USB_DEVICE(ASB_VENDOR_ID, ASB_PRODUCT_T920) }, /*ASB T920 */
++	{ USB_DEVICE(ASB_VENDOR_ID, ASB_PRODUCT_TU930) }, /*ASB TU930 */
++	{ USB_DEVICE(TechFaith_VENDOR_ID,TechFaith_PRODUCT_HSDPA) },/*TechFaith WCDMA product*/
++	{ USB_DEVICE(TechFaith_VENDOR_ID,TechFaith_PRODUCT_SRTE800) },/*TechFaith WCDMA product*/	
+ 	{ USB_DEVICE(PETATEL_VENDOR_ID, PETATEL_PRODUCT_NP10T) },
+ 	{ USB_DEVICE(TPLINK_VENDOR_ID, TPLINK_PRODUCT_MA180),
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+@@ -1464,6 +1515,10 @@ static int option_probe(struct usb_serial *serial,
+ 		serial->interface->cur_altsetting->desc.bInterfaceClass != USB_CLASS_CDC_DATA)
+ 		return -ENODEV;
+ 
++	if (serial->dev->descriptor.idVendor == HUAWEI_VENDOR_ID) {
++		usb_enable_autosuspend(serial->dev);
++	}
++
+ 	data = serial->private = kzalloc(sizeof(struct usb_wwan_intf_private), GFP_KERNEL);
+ 	if (!data)
+ 		return -ENOMEM;
+diff --git a/drivers/usb/storage/initializers.c b/drivers/usb/storage/initializers.c
+index 105d900..657c986 100644
+--- a/drivers/usb/storage/initializers.c
++++ b/drivers/usb/storage/initializers.c
+@@ -95,6 +95,7 @@ int usb_stor_ucr61s2b_init(struct us_data *us)
+ /* This places the HUAWEI E220 devices in multi-port mode */
+ int usb_stor_huawei_e220_init(struct us_data *us)
+ {
++#if 0
+ 	int result;
+ 
+ 	result = usb_stor_control_msg(us, us->send_ctrl_pipe,
+@@ -103,4 +104,65 @@ int usb_stor_huawei_e220_init(struct us_data *us)
+ 				      0x01, 0x0, NULL, 0x0, 1000);
+ 	US_DEBUGP("Huawei mode set result is %d\n", result);
+ 	return 0;
++#else
++	printk("====usb_stor_huawei_e220_init===>\n");
++	return -ENODEV;
++#endif
++
++}
++
++//AC560--ZTE--	0x19d20026->0x19d20094	before convert to modem,don't report disk dev
++int usb_stor_ZTE_AC580_init(struct us_data *us) // PID = 0x0026
++{
++#if 0	
++	int result = 0;
++	int act_len = 0;
++
++	result = usb_stor_control_msg(us, us->send_ctrl_pipe,USB_REQ_CLEAR_FEATURE,
++		USB_TYPE_STANDARD | USB_RECIP_ENDPOINT,0x0, 0x89, NULL, 0x0, 1000);
++
++	US_DEBUGP("usb_stor_control_msg performing result is %d\n", result);
++	printk("====AC580/AC560===>usb_stor_control_msg performing result is %d\n", result);
++
++	result = usb_stor_control_msg(us, us->send_ctrl_pipe,USB_REQ_CLEAR_FEATURE,
++		USB_TYPE_STANDARD | USB_RECIP_ENDPOINT,0x0, 0x9, NULL, 0x0, 1000);
++
++	US_DEBUGP("usb_stor_control_msg performing result is %d\n", result);
++	printk("====AC580/AC560===>usb_stor_control_msg performing result is %d\n", result);
++	return (result ? 0 : -ENODEV);
++#else
++	return -ENODEV;
++#endif
++}
++
++//AC560--ZTE--	0x19d20026->0x19d20094	before convert to modem,don't report disk dev
++int usb_stor_ZTE_AC580_init2(struct us_data *us) // PID = 0x0026
++{
++	return -ENODEV;
++}
++
++int usb_stor_ASB_init(struct us_data *us)
++{
++	return -ENODEV;
++}
++
++int usb_stor_TechFaith_init(struct us_data *us)
++{
++	usb_stor_port_reset(us);
++	return -ENODEV;
++}
++
++int usb_stor_Shichuangxing_init(struct us_data *us)
++{
++	printk("====usb_stor_Shichuangxing_init===>\n");
++	return -ENODEV;
++}
++
++int usb_stor_wangxun_init(struct us_data *us)
++{
++	
++	printk("====usb_stor_wangxun_init===>\n");
++	usb_stor_port_reset(us);	
++	return -ENODEV;
++	
+ }
+diff --git a/drivers/usb/storage/initializers.h b/drivers/usb/storage/initializers.h
+index 529327f..fa90a23 100644
+--- a/drivers/usb/storage/initializers.h
++++ b/drivers/usb/storage/initializers.h
+@@ -48,3 +48,10 @@ int usb_stor_ucr61s2b_init(struct us_data *us);
+ 
+ /* This places the HUAWEI E220 devices in multi-port mode */
+ int usb_stor_huawei_e220_init(struct us_data *us);
++
++int usb_stor_ZTE_AC580_init(struct us_data *us);
++int usb_stor_ZTE_AC580_init2(struct us_data *us);
++int usb_stor_ASB_init(struct us_data *us);
++int usb_stor_TechFaith_init(struct us_data *us);
++int usb_stor_Shichuangxing_init(struct us_data *us);
++int usb_stor_wangxun_init(struct us_data *us);
+diff --git a/drivers/usb/storage/unusual_devs.h b/drivers/usb/storage/unusual_devs.h
+index 8ee632c..70bf4f7 100644
+--- a/drivers/usb/storage/unusual_devs.h
++++ b/drivers/usb/storage/unusual_devs.h
+@@ -768,6 +768,12 @@ UNUSUAL_DEV( 0x05ac, 0x120a, 0x0000, 0x9999,
+  * Ignore driver CD mode and force into modem mode by default.
+  */
+ 
++UNUSUAL_DEV(  0x05c6, 0x1000, 0x0000, 0x0000,
++		"HUAWEI MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
++		0),
++
+ /* Globetrotter HSDPA; mass storage shows up as Qualcomm for vendor */
+ UNUSUAL_DEV(  0x05c6, 0x1000, 0x0000, 0x9999,
+ 		"Option N.V.",
+@@ -1852,6 +1858,183 @@ UNUSUAL_DEV(  0x12d1, 0x143F, 0x0000, 0x0000,
+ 		"Mass Storage",
+ 		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
+ 		0),
++UNUSUAL_DEV(  0x12d1, 0x1446, 0x0000, 0x0000,
++		"HUAWEI MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
++		0),
++UNUSUAL_DEV(  0x12d1, 0x14ac, 0x0000, 0x0000,
++		"HUAWEI MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
++		0),
++UNUSUAL_DEV(  0x12d1, 0x1505, 0x0000, 0x0000,
++		"HUAWEI MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
++		0),
++UNUSUAL_DEV(  0x12d1, 0x1506, 0x0000, 0x0000,
++		"HUAWEI MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
++		0),
++UNUSUAL_DEV(  0x12d1, 0x1d09, 0x0100, 0x0100,
++		"HUAWEI MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
++		0),
++
++UNUSUAL_DEV(  0x12d1, 0x1da1, 0x0100, 0x0100,
++		"HUAWEI MOBILE-TD",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
++		0),
++
++
++UNUSUAL_DEV(  0x05c6, 0x6000, 0x0000, 0x0000,
++		"HUAWEI MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_huawei_e220_init,
++		0),
++//MU350--ZTE--	0x19D20003->0x19D20003	don't report disk device
++UNUSUAL_DEV(0x19D2,0x0003,0x0100,0x0100,
++		"ZTE MOBILE-TD",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init,
++		0),
++
++
++//A355--ZTE--	0x19D20120->0x19D20079	don't report disk device
++UNUSUAL_DEV(0x19D2,0x0120,0x0204  ,0x0204  ,
++		"ZTE MOBILE-TD",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_ZTE_AC580_init,
++		0),
++
++//A355--ZTE--	0x19D20120->0x19D20079	don't report disk device
++UNUSUAL_DEV(0x19D2,0x0079,0x0100  ,0x0100  ,
++		"ZTE MOBILE-TD",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_ZTE_AC580_init,
++		0),
++
++//TU930--GaoKeZhongtian--	0x04cc225a->0x04cc225a	don't report disk device
++UNUSUAL_DEV(0x04cc,0x225a,0x100,0x100,
++		"GaoKeZhongtian MOBILE-TD",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_ZTE_AC580_init,
++		0),
++
++//AC560--ZTE--	0x19d20026->0x19d20094	don't report disk device
++UNUSUAL_DEV(0x19D2,0x0026,0x0000,0x0000,
++		"ZTE MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init,
++		0),
++
++//MF626/MF633/MF110--ZTE--	0x19d22000->0x19d20031	don't report disk device
++UNUSUAL_DEV(0x19D2,0x0031,0x0000,0x0000,
++		"ZTE MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init2,
++		0),
++
++//AC560--ZTE--	0x19d20026->0x19d20094	don't report disk device
++UNUSUAL_DEV(0x19D2,0x0094,0x0000,0x0000,
++		"ZTE MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init2,
++		0),
++
++//AC560--ZTE--	0x19d20026->0x19d20152	don't report disk device
++UNUSUAL_DEV(0x19D2,0x0152,0x0000,0x0000,
++		"ZTE MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init2,
++		0),
++
++//MF626/MF633/MF110--ZTE--	0x19d22000->0x19d20031	don't report disk device
++UNUSUAL_DEV(0x19D2,0x2000,0x0000,0x0000,
++		"ZTE MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init,
++		0),
++
++//MF637U--ZTE--	don't report disk device
++UNUSUAL_DEV(0x19D2,0xf006,0x0000,0x0000,
++		"ZTE MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init2,
++		0),
++
++//MF637U--ZTE--	 ->0x19d2fff1	don't report disk device
++UNUSUAL_DEV(0x19D2,0xfff1,0x0000,0x0000,
++		"ZTE MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init2,
++		0),
++
++//AC2736/AC2746	don't report disk device
++UNUSUAL_DEV(0x19D2,0xfff5,0x0000,0x0000,
++		"ZTE MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ZTE_AC580_init2,
++		0),
++
++//shanghai ASB T920--ASB--don't report disk device
++UNUSUAL_DEV(0x04cc,0x226e,0x0100,0x0100,
++		"ASB MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_ASB_init,
++		0),
++
++//shanghai ASB C820--ASB--don't report disk device
++UNUSUAL_DEV(0x05c6,0x0010,0x00,0x00,
++		"ASB MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_ASB_init,
++		0),
++
++//shanghai ASB C820--ASB--don't report disk device
++UNUSUAL_DEV(0x05c6,0x00a0,0x00,0x00,
++		"ASB MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_ASB_init,
++		0),
++
++//TechFaith--don't report disk device
++UNUSUAL_DEV(0x1d09,0x1010,0x0,0x0,
++		"TechFaith MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_TechFaith_init,
++		0),
++//TechFaith--don't report disk device
++UNUSUAL_DEV(0x1d09,0x1000,0x0,0x0,
++		"TechFaith MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_TechFaith_init,
++		0),
++
++//wangxun--don't report disk device
++UNUSUAL_DEV(0x1e89,0x1e16,0x0,0x0,
++		"wangxun MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_wangxun_init,
++		0),
++
++//TechFaith--don't report disk device
++UNUSUAL_DEV(0x1e89,0x1a20,0x0,0x0,
++		"Shichuangxing MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_TechFaith_init,
++		0),
++
++//TechFaith--don't report disk device
++UNUSUAL_DEV(0x1e89,0xf000,0x0,0x0,
++		"Shichuangxing MOBILE",
++		"Mass Storage",
++		USB_SC_DEVICE,USB_PR_DEVICE,usb_stor_Shichuangxing_init,
++		0),
+ 
+ /* Reported by Vilius Bilinkevicius <vilisas AT xxx DOT lt) */
+ UNUSUAL_DEV(  0x132b, 0x000b, 0x0001, 0x0001,
