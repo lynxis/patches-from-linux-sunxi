@@ -52510,18 +52510,6 @@ index 0000000..76181e7
 +	return EGPIO_FAIL;
 +}
 +EXPORT_SYMBOL(gpio_write_one_pin_value);
-diff --git a/arch/arm/tools/mach-types b/arch/arm/tools/mach-types
-index f9c9f33..c24cac1 100644
---- a/arch/arm/tools/mach-types
-+++ b/arch/arm/tools/mach-types
-@@ -1169,3 +1169,7 @@ elite_ulk		MACH_ELITE_ULK		ELITE_ULK		3888
- pov2			MACH_POV2		POV2			3889
- ipod_touch_2g		MACH_IPOD_TOUCH_2G	IPOD_TOUCH_2G		3890
- da850_pqab		MACH_DA850_PQAB		DA850_PQAB		3891
-+sun4i			MACH_SUN4I		SUN4I			4104
-+sun5i			MACH_SUN5I		SUN5I			4138
-+sun6i			MACH_SUN6I		SUN6I			4137
-+sun7i			MACH_SUN7I		SUN7I			4283
 diff --git a/arch/arm/vfp/entry.S b/arch/arm/vfp/entry.S
 index 323ce1a..d7a57e5 100644
 --- a/arch/arm/vfp/entry.S
