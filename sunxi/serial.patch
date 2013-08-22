@@ -506,17 +506,3 @@ index d8b0aee..c49f3bf 100644
  		ourport->rx_claimed = 0;
  		rx_enabled(port) = 0;
  	}
-diff --git a/drivers/tty/serial/serial_core.c b/drivers/tty/serial/serial_core.c
-index 246b823..a4895dc 100644
---- a/drivers/tty/serial/serial_core.c
-+++ b/drivers/tty/serial/serial_core.c
-@@ -94,6 +94,9 @@ static void __uart_start(struct tty_struct *tty)
- 	struct uart_state *state = tty->driver_data;
- 	struct uart_port *port = state->uart_port;
- 
-+	if (port->ops->wake_peer)
-+		port->ops->wake_peer(port);
-+
- 	if (!uart_circ_empty(&state->xmit) && state->xmit.buf &&
- 	    !tty->stopped && !tty->hw_stopped)
- 		port->ops->start_tx(port);
