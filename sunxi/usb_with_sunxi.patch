@@ -2,7 +2,7 @@ diff --git a/drivers/Makefile b/drivers/Makefile
 index 95952c8..d18aab6 100644
 --- a/drivers/Makefile
 +++ b/drivers/Makefile
-@@ -74,9 +74,11 @@ obj-$(CONFIG_USB_OTG_UTILS)	+= usb/
+@@ -74,9 +74,10 @@ obj-$(CONFIG_USB_OTG_UTILS)	+= usb/
  obj-$(CONFIG_USB)		+= usb/
  obj-$(CONFIG_PCI)		+= usb/
  obj-$(CONFIG_USB_GADGET)	+= usb/
