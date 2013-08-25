@@ -67,25 +67,12 @@ index d537431..894aeee 100644
  	serial_port_out(port, UART_MCR, mcr);
  }
  
-diff --git a/drivers/tty/serial/8250/8250.h b/drivers/tty/serial/8250/8250.h
-index 2868a1d..5d23bd1 100644
---- a/drivers/tty/serial/8250/8250.h
-+++ b/drivers/tty/serial/8250/8250.h
-@@ -75,6 +75,8 @@ struct serial8250_config {
- #define UART_BUG_NOMSR	(1 << 2)	/* UART has buggy MSR status bits (Au1x00) */
- #define UART_BUG_THRE	(1 << 3)	/* UART has buggy THRE reassertion */
- 
-+#define UART_USR        31
-+
- #define PROBE_RSA	(1 << 0)
- #define PROBE_ANY	(~0)
- 
 diff --git a/drivers/tty/serial/8250/8250_sunxi.c b/drivers/tty/serial/8250/8250_sunxi.c
 new file mode 100644
 index 0000000..7ebf536
 --- /dev/null
 +++ b/drivers/tty/serial/8250/8250_sunxi.c
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,375 @@
 +/*
 + *  8250_sunxi.c
 + *
@@ -108,6 +95,7 @@ index 0000000..7ebf536
 + * raised, the LCR needs to be rewritten and the uart status register read.
 + */
 +#define pr_fmt(fmt)	"[uart]: " fmt
++#define UART_USR        31
 +
 +#include <linux/module.h>
 +#include <linux/types.h>
